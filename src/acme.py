@@ -136,7 +136,10 @@ def _normalize_challenge(challenge: str) -> str:
         return "http"
     if c in ("dns", "dns-01", "dns01"):
         return "dns"
-    raise ValueError(f"unsupported challenge '{challenge}' (expected http/dns)")
+    if c in ("tls-alpn", "tls-alpn-01", "tlsalpn01", "tls_alpn", "tls_alpn_01"):
+        return "tls-alpn"
+    raise ValueError(
+        f"unsupported challenge '{challenge}' (expected http/dns/tls-alpn)")
 
 
 def issue_argv(domain: str, email: str, challenge: str, *,
@@ -147,8 +150,12 @@ def issue_argv(domain: str, email: str, challenge: str, *,
                bin_path: str = CERTBOT_BIN) -> List[str]:
     """Build the ``certbot certonly`` argv for one domain.
 
-    HTTP-01 → ``--standalone`` (default) or ``--webroot -w <webroot>``.
-    DNS-01  → ``--dns-<provider> --dns-<provider>-credentials <ini>``.
+    HTTP-01     → ``--standalone`` (default) or ``--webroot -w <webroot>``.
+    DNS-01      → ``--dns-<provider> --dns-<provider>-credentials <ini>``.
+    TLS-ALPN-01 → ``--preferred-challenges tls-alpn-01``. certbot ships no
+    authenticator for this challenge by default; it requires a TLS-ALPN-01
+    plugin installed on the host. If none is present, certbot itself fails
+    with a clear "no authenticator" message, surfaced verbatim by ``issue()``.
     """
     ch = _normalize_challenge(challenge)
     argv: List[str] = [bin_path, "certonly", "--non-interactive",
@@ -158,13 +165,14 @@ def issue_argv(domain: str, email: str, challenge: str, *,
         argv += ["-m", email]
     if key_type:
         argv += ["--key-type", key_type]
-    argv += ["--preferred-challenges", ch]
+    argv += ["--preferred-challenges",
+             "tls-alpn-01" if ch == "tls-alpn" else ch]
     if ch == "http":
         if webroot:
             argv += ["--webroot", "-w", webroot]
         else:
             argv += ["--standalone"]
-    else:  # dns
+    elif ch == "dns":
         if not dns_provider:
             raise ValueError("dns challenge requires dns_provider")
         argv += [f"--dns-{dns_provider}"]
@@ -172,6 +180,8 @@ def issue_argv(domain: str, email: str, challenge: str, *,
             argv += [f"--dns-{dns_provider}-credentials", dns_creds_ini]
         argv += [f"--dns-{dns_provider}-propagation-seconds",
                  str(propagation_seconds)]
+    # tls-alpn: no extra argv — whatever authenticator plugin is installed on
+    # the host picks up the challenge from --preferred-challenges above.
     if staging:
         argv.append("--staging")
     return argv

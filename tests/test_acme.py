@@ -78,6 +78,17 @@ def test_issue_bad_challenge_raises():
         assert False, f"challenge {bad!r} should raise"
 
 
+def test_issue_tls_alpn_argv():
+    for alias in ("tls-alpn", "tls-alpn-01", "tlsalpn01"):
+        argv = acme.issue_argv("example.com", "a@b.com", alias)
+        assert "--preferred-challenges" in argv
+        i = argv.index("--preferred-challenges")
+        assert argv[i + 1] == "tls-alpn-01"
+        # No HTTP/DNS-specific flags leak in.
+        assert "--standalone" not in argv and "--webroot" not in argv
+        assert not any(a.startswith("--dns-") for a in argv)
+
+
 def test_issue_empty_or_none_challenge_defaults_to_http():
     for dflt in ("", None):
         argv = acme.issue_argv("example.com", "a@b.com", dflt)
