@@ -3,7 +3,9 @@ set -e
 
 # Lab Manager — Certificate Management (le) spoke installer.
 # Mirrors install_opnsense.sh: clones core + le into /opt/lm, builds the venv,
-# writes .env, and installs the lm-le systemd service (User=svc_lm).
+# writes .env, and installs the lm-le systemd service. Runs as ROOT because
+# certbot binds port 80 (HTTP-01 standalone), writes /etc/letsencrypt, and the
+# spoke writes root-only DNS credentials to /etc/lm-le.
 
 # Default Configuration
 HUB_URL="ws://localhost:8765"
@@ -40,7 +42,12 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update
-apt-get install -y python3-pip python3-venv git curl
+apt-get install -y python3-pip python3-venv git curl openssl certbot \
+    python3-certbot-dns-cloudflare python3-certbot-dns-route53
+# Note: only cloudflare + route53 DNS plugins are preinstalled. Other certbot
+# DNS plugins (e.g. python3-certbot-dns-google, -digitalocean) can be apt-apt
+# installed on demand when a DNS-01 issue targets that provider. HTTP-01 needs
+# no plugin. cryptography (cert parsing) is pip-installed into the venv below.
 
 INSTALL_DIR="/opt/lm"
 mkdir -p "$INSTALL_DIR"
@@ -90,10 +97,17 @@ HUB_SECRET=$HUB_SECRET
 EOF
 
 # Shared log dir; the service logs to stderr and systemd captures it to
-# /var/log/lm/lm-le.log (root-owned append file). svc_lm owns the dir so it can
-# create other runtime files here; the append file itself is owned by systemd.
+# /var/log/lm/lm-le.log (root-owned append file). Root service owns the dir.
 mkdir -p /var/log/lm
-chown -R svc_lm:svc_lm /var/log/lm 2>/dev/null || true
+
+# DNS-provider credentials dir (DNS-01). Root-only; the spoke writes
+# dns-<provider>.ini here at 0600. Secrets — never logged, never committed.
+mkdir -p /etc/lm-le
+chmod 700 /etc/lm-le
+
+# Per-spoke state dir for the cert ledger (/var/lib/lm/<spoke_id>/certs.json).
+# The spoke creates its own subdir at runtime; ensure the parent exists.
+mkdir -p /var/lib/lm
 
 # --- Systemd Service ---
 echo "⚙️ Creating systemd service for auto-start..."
@@ -104,7 +118,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=svc_lm
+User=root
 WorkingDirectory=$INSTALL_DIR/le
 EnvironmentFile=$INSTALL_DIR/le/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/le/src"
