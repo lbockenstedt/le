@@ -262,3 +262,69 @@ def test_unknown_command_errors(tmp_path, monkeypatch):
     spoke = _spoke(tmp_path, monkeypatch)
     res = _cmd(spoke, "LE_NOPE")
     assert res["status"] == "ERROR" and "Unknown command" in res["message"]
+
+
+# ── event-driven distribution (LE_CERT_RENEWED) ──────────────────────────────
+
+class _FakeCP:
+    """Records unsolicited send_to_hub calls so we can assert the le spoke
+    notifies the hub on a renew without a real websocket."""
+    def __init__(self):
+        self.events = []
+
+    async def send_to_hub(self, payload_type, data):
+        self.events.append({"type": payload_type, "data": data})
+        return True
+
+
+def _spoke_with_cp(tmp_path, monkeypatch):
+    _install_acme_mocks(monkeypatch)
+    cfg = {"ledger_path": str(tmp_path / "certs.json")}
+    cp = _FakeCP()
+    return LESpoke("le-spoke-1", cfg, control_plane=cp), cp
+
+
+def test_notify_renewed_emits_event_with_targets(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_cp(tmp_path, monkeypatch)
+    entry = {"material_hash": _HASH, "targets": [
+        {"module_type": "firewall", "identifier": "edge-1"}]}
+    _run(spoke._notify_renewed("example.com", entry))
+    assert len(cp.events) == 1
+    assert cp.events[0]["type"] == "LE_CERT_RENEWED"
+    assert cp.events[0]["data"]["domain"] == "example.com"
+    assert cp.events[0]["data"]["material_hash"] == _HASH
+    assert cp.events[0]["data"]["targets"] == entry["targets"]
+
+
+def test_notify_renewed_noop_without_control_plane(tmp_path, monkeypatch):
+    # Default construction (no control_plane) — must not raise + must not try
+    # to send. The hourly hub loop is the fallback for this path.
+    spoke = _spoke(tmp_path, monkeypatch)
+    assert spoke.control_plane is None
+    _run(spoke._notify_renewed("example.com", {"material_hash": _HASH,
+                                               "targets": []}))  # no error
+
+
+def test_renew_emits_le_cert_renewed_event(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_cp(tmp_path, monkeypatch)
+    _cmd(spoke, "LE_ISSUE_CERT", {
+        "domain": "example.com", "email": "a@b.com", "challenge": "http",
+        "targets": [{"module_type": "firewall", "identifier": "edge-1"}]})
+    res = _cmd(spoke, "LE_RENEW_CERT", {"domain": "example.com"})
+    assert res["status"] == "SUCCESS"
+    # The renew notified the hub so distribution fires immediately (vs. 1h poll).
+    renewed = [e for e in cp.events if e["type"] == "LE_CERT_RENEWED"
+               and e["data"]["domain"] == "example.com"]
+    assert len(renewed) == 1
+    assert renewed[0]["data"]["material_hash"] == _HASH
+    assert renewed[0]["data"]["targets"][0]["module_type"] == "firewall"
+
+
+def test_renew_failure_does_not_emit_event(tmp_path, monkeypatch):
+    _install_acme_mocks(monkeypatch, renew_status="ERROR")
+    cfg = {"ledger_path": str(tmp_path / "certs.json")}
+    cp = _FakeCP()
+    spoke = LESpoke("le-spoke-1", cfg, control_plane=cp)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    _cmd(spoke, "LE_RENEW_CERT", {"domain": "example.com"})
+    assert [e for e in cp.events if e["type"] == "LE_CERT_RENEWED"] == []

@@ -66,7 +66,9 @@ class LEControlPlane(BaseControlPlane):
     async def run_hub_mode(self):
         """Native LM spoke behavior: register the le spoke and run the loop."""
         logger.info(f"Starting Certificate Management (le) module -> {self.hub_url}")
-        le_spoke = LESpoke(self.spoke_id, self.config)
+        # Pass self so LESpoke can emit unsolicited LE_CERT_RENEWED events to the
+        # hub via send_to_hub (event-driven distribution instead of hourly poll).
+        le_spoke = LESpoke(self.spoke_id, self.config, control_plane=self)
         self.register_module("le", le_spoke)
         await self.run()
 

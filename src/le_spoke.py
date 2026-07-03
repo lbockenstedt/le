@@ -69,10 +69,16 @@ def _now_iso() -> str:
 class LESpoke(BaseSpoke):
     """Let's Encrypt / certificate-management spoke."""
 
-    def __init__(self, spoke_id: str, config: Dict[str, Any]):
+    def __init__(self, spoke_id: str, config: Dict[str, Any],
+                 control_plane: Any = None):
         # Set BEFORE super().__init__: background workers the base may start in
         # run() can read these (opnsense ordering rule).
         self._renew_task: Optional[asyncio.Task] = None
+        # Reference to the LEControlPlane so the renewal loop can emit
+        # LE_CERT_RENEWED to the hub (event-driven distribution) via send_to_hub.
+        # None when constructed standalone (tests) — the hourly hub loop is the
+        # fallback, so a missing control_plane just skips the notify.
+        self.control_plane = control_plane
         ledger_path = config.get("ledger_path") or os.getenv(
             "LM_LE_LEDGER", os.path.join(_DEFAULT_LEDGER_DIR, spoke_id, "certs.json"))
         self.ledger = Ledger(ledger_path)
@@ -138,6 +144,9 @@ class LESpoke(BaseSpoke):
                         entry["material_hash"] = mat2.get("material_hash")
                         entry["not_after"] = mat2.get("not_after")
                     changed = True
+                    # Event-driven distribution: tell the hub now so it
+                    # re-pushes the new material instead of waiting up to 1h.
+                    await self._notify_renewed(domain, entry)
                 else:
                     entry["last_error"] = res.get("message")
                     logger.error("renew failed for %s: %s", domain,
@@ -158,6 +167,23 @@ class LESpoke(BaseSpoke):
         e = dict(entry)
         e.setdefault("targets", [])
         return e
+
+    async def _notify_renewed(self, domain: str, entry: Dict[str, Any]) -> None:
+        """Emit LE_CERT_RENEWED to the hub so it re-distributes the renewed
+        cert material immediately (event-driven, vs. waiting up to 1h for the
+        hourly poll). Best-effort: skipped when there's no control_plane or the
+        spoke isn't connected yet — the hub's hourly loop is the fallback, so a
+        missed event never leaves a cert undistributed."""
+        if not self.control_plane:
+            return
+        try:
+            await self.control_plane.send_to_hub("LE_CERT_RENEWED", {
+                "domain": domain,
+                "material_hash": entry.get("material_hash"),
+                "targets": entry.get("targets", []),
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LE_CERT_RENEWED notify for %s failed: %s", domain, e)
 
     # ── BaseSpoke contract ────────────────────────────────────────────────────
 
@@ -339,6 +365,9 @@ class LESpoke(BaseSpoke):
                 renewed.append({"domain": d, "renewed": res.get("renewed", True),
                                 "material_hash": entry.get("material_hash"),
                                 "targets": entry.get("targets", [])})
+                # Event-driven distribution: tell the hub now so it re-pushes
+                # the new material instead of waiting up to 1h for the poll.
+                await self._notify_renewed(d, entry)
             else:
                 entry["last_error"] = res.get("message")
                 renewed.append({"domain": d, "renewed": False,
