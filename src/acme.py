@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("LEAcme")
@@ -40,6 +41,68 @@ _PEM_CERT_RE = re.compile(
 def present(bin_path: str = CERTBOT_BIN) -> bool:
     """True if a certbot binary is on PATH."""
     return bool(shutil.which(bin_path))
+
+
+# certbot DNS-01 plugins → Debian apt package. cloudflare + route53 are
+# apt-preinstalled by install_le.sh; the rest are apt-installed ON DEMAND by
+# ensure_dns_plugin() when a DNS-01 issue targets them. The system certbot
+# (not the venv python) loads these, so presence is checked via dpkg, not
+# importlib (the venv doesn't see system site-packages).
+_DNS_PLUGIN_APT: Dict[str, str] = {
+    "cloudflare": "python3-certbot-dns-cloudflare",
+    "route53": "python3-certbot-dns-route53",
+    "google": "python3-certbot-dns-google",
+    "digitalocean": "python3-certbot-dns-digitalocean",
+    "linode": "python3-certbot-dns-linode",
+    "rfc2136": "python3-certbot-dns-rfc2136",
+    "hetzner": "python3-certbot-dns-hetzner",
+    "inwx": "python3-certbot-dns-inwx",
+    "transip": "python3-certbot-dns-transip",
+}
+
+
+def dns_plugin_present(provider: str) -> bool:
+    """True if the certbot DNS-01 plugin apt package for ``provider`` is
+    installed system-wide (the system certbot loads it, not the venv python)."""
+    pkg = _DNS_PLUGIN_APT.get((provider or "").strip().lower())
+    if not pkg:
+        return False
+    try:
+        p = subprocess.run(["dpkg", "-s", pkg],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+async def ensure_dns_plugin(provider: str) -> Dict[str, Any]:
+    """Make sure the certbot DNS-01 plugin for ``provider`` is installed.
+
+    cloudflare + route53 are preinstalled; others apt-install on demand here.
+    Best-effort: a failure returns ``{status: ERROR}`` so the caller surfaces a
+    clear message instead of a confusing certbot plugin-not-found traceback.
+    The le spoke runs as root, so apt-get is available.
+    """
+    prov = (provider or "").strip().lower()
+    if dns_plugin_present(prov):
+        return {"status": "SUCCESS", "message": f"dns plugin {prov} already installed"}
+    pkg = _DNS_PLUGIN_APT.get(prov)
+    if not pkg:
+        return {"status": "ERROR",
+                "message": f"no apt package mapped for dns provider '{prov}'; "
+                           f"install the certbot plugin manually"}
+    argv = ["apt-get", "install", "-y", "-qq", pkg]
+    logger.info("installing DNS plugin on demand: %s", " ".join(argv))
+    rc, out, err = await _run(argv, timeout=180.0)
+    if rc != 0:
+        return {"status": "ERROR",
+                "message": f"apt install {pkg} failed: {(err or out).strip()[:300]}"}
+    if not dns_plugin_present(prov):
+        return {"status": "ERROR",
+                "message": f"{pkg} installed but dpkg still reports absent — "
+                           f"retry or install manually"}
+    return {"status": "SUCCESS", "message": f"installed {pkg}"}
 
 
 def _dns_creds_path(provider: str, creds_dir: str = DNS_CREDS_DIR) -> str:
@@ -173,6 +236,13 @@ async def issue(domain: str, email: str, challenge: str, *,
     if _normalize_challenge(challenge) == "dns":
         if dns_creds and not ini:
             ini = write_dns_creds(dns_provider, dns_creds)
+        # On-demand install of the DNS-01 plugin for providers not
+        # preinstalled by the installer (cloudflare/route53 are). Best-effort;
+        # a failure here surfaces a clear message instead of a certbot traceback.
+        plug = await ensure_dns_plugin(dns_provider)
+        if plug.get("status") != "SUCCESS":
+            return {"status": "ERROR",
+                    "message": f"DNS plugin unavailable: {plug.get('message')}"}
     argv = issue_argv(domain, email, challenge, webroot=webroot,
                       dns_provider=dns_provider, dns_creds_ini=ini,
                       staging=staging, key_type=key_type, cert_name=cert_name,

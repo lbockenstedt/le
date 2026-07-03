@@ -167,3 +167,63 @@ def test_write_dns_creds_overwrite():
         acme.write_dns_creds("cloudflare", "new = 2", creds_dir=d)
         with open(os.path.join(d, "dns-cloudflare.ini")) as f:
             assert f.read() == "new = 2"
+
+# ── DNS-01 on-demand plugin install ──────────────────────────────────────────
+
+class _FakeProc:
+    def __init__(self, rc): self.returncode = rc
+
+def test_dns_plugin_present_true_on_dpkg_ok(monkeypatch):
+    monkeypatch.setattr(acme.subprocess, "run", lambda *a, **k: _FakeProc(0))
+    assert acme.dns_plugin_present("cloudflare") is True
+
+def test_dns_plugin_present_false_on_dpkg_fail(monkeypatch):
+    monkeypatch.setattr(acme.subprocess, "run", lambda *a, **k: _FakeProc(1))
+    assert acme.dns_plugin_present("cloudflare") is False
+
+def test_dns_plugin_present_false_for_unmapped_provider():
+    # No apt package mapped for a bogus provider → False (don't even call dpkg).
+    assert acme.dns_plugin_present("nosuchprovider") is False
+
+
+def test_ensure_dns_plugin_noop_when_present(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(acme, "dns_plugin_present", lambda p: True)
+    res = asyncio.new_event_loop().run_until_complete(acme.ensure_dns_plugin("cloudflare"))
+    assert res["status"] == "SUCCESS"
+    assert "already installed" in res["message"]
+
+
+def test_ensure_dns_plugin_installs_when_missing(monkeypatch):
+    import asyncio
+    # First lookup (present check) → False; after _run returns rc 0, the second
+    # present check → True (plugin now installed).
+    state = {"installed": False}
+    def _present(p): return state["installed"]
+    async def _fake_run(argv, timeout=180.0):
+        state["installed"] = True
+        return 0, "", ""
+    monkeypatch.setattr(acme, "dns_plugin_present", _present)
+    monkeypatch.setattr(acme, "_run", _fake_run)
+    res = asyncio.new_event_loop().run_until_complete(acme.ensure_dns_plugin("google"))
+    assert res["status"] == "SUCCESS"
+    assert "python3-certbot-dns-google" in res["message"]
+
+
+def test_ensure_dns_plugin_unmapped_provider_errors(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(acme, "dns_plugin_present", lambda p: False)
+    res = asyncio.new_event_loop().run_until_complete(acme.ensure_dns_plugin("nosuch"))
+    assert res["status"] == "ERROR"
+    assert "no apt package mapped" in res["message"]
+
+
+def test_ensure_dns_plugin_apt_failure_errors(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(acme, "dns_plugin_present", lambda p: False)
+    async def _bad_run(argv, timeout=180.0):
+        return 1, "", "E: Unable to locate package\n"
+    monkeypatch.setattr(acme, "_run", _bad_run)
+    res = asyncio.new_event_loop().run_until_complete(acme.ensure_dns_plugin("google"))
+    assert res["status"] == "ERROR"
+    assert "apt install" in res["message"]

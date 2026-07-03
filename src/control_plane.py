@@ -1,6 +1,7 @@
 import logging
 import argparse
 import asyncio
+import os
 from typing import Dict, Any
 
 # Two-tier import shim (deploy-order safe). In production the lm core is on
@@ -34,10 +35,10 @@ except ImportError:
             _logging.basicConfig(level=default_level, force=True,
                                  format=_FMT, datefmt=_DFMT, handlers=handlers)
 
-# Log to stderr only — the systemd unit (User=svc_lm) captures stderr to
+# Log to stderr only — the systemd unit (User=root, because certbot binds :80
+# and writes /etc/letsencrypt + /etc/lm-le) captures stderr to
 # /var/log/lm/lm-le.log via StandardOutput/StandardError=append:, and the
-# systemd manager opens that file as root before dropping to svc_lm. A svc_lm
-# FileHandler can't append to the root-owned file (PermissionError → crash-loop).
+# systemd manager opens that file as root before the service starts.
 # configure_logging() with no log_file attaches only the stderr StreamHandler.
 configure_logging()
 logger = logging.getLogger("LEControlPlane")
@@ -77,7 +78,13 @@ if __name__ == "__main__":
                         help="Authentication secret (default: lm-secret)")
     parser.add_argument("--hub-secret", nargs='?', default="", const="",
                         help="Hub authentication secret for mutual auth")
-    parser.add_argument("--hub", required=True, help="Hub WebSocket URL")
+    # --hub is NOT required: omit it (or pass 'auto'/empty) and BaseControlPlane
+    # auto-discovers the hub (DNS lm-hub.<suffix> then mDNS) on each connect,
+    # same as every other LM spoke. Default to the HUB_URL env (the installer
+    # writes HUB_URL=auto to .env + EnvironmentFile) so an empty/unset value
+    # becomes the auto-discovery sentinel instead of an argparse crash.
+    parser.add_argument("--hub", default=os.getenv("HUB_URL") or "auto",
+                        help="Hub WebSocket URL (or 'auto' to discover; default auto)")
     args = parser.parse_args()
 
     cp = LEControlPlane(args.id, args.secret, args.hub_secret, args.hub)
