@@ -122,20 +122,30 @@ class LESpoke(BaseSpoke):
             await asyncio.sleep(self._renew_interval)
 
     async def _reconcile_and_renew(self):
-        state = self.ledger.load()
-        certs = state.get("certs", {})
+        # Operate on self._certs IN PLACE — the SAME dict the command handlers
+        # mutate. The old code loaded a separate ``state`` snapshot, awaited the
+        # long acme_renew, then reassigned ``self._certs = state``, silently
+        # clobbering any LE_ADD_TARGET / LE_MARK_DISTRIBUTED a handler applied
+        # during the await (lost update). Iterating a list() snapshot means a
+        # concurrent add/remove doesn't break the loop.
+        certs = self._certs.setdefault("certs", {})
         changed = False
         for domain, entry in list(certs.items()):
             # Refresh not_after + material_hash from disk (certbot may have
-            # renewed out-of-band, or the ledger is stale post-restart).
+            # renewed out-of-band, or the ledger is stale post-restart). Only mark
+            # changed on an ACTUAL diff so we don't rewrite the ledger every tick.
             mat = read_material(domain)
-            if mat.get("status") == "SUCCESS":
+            if mat.get("status") == "SUCCESS" and (
+                    entry.get("material_hash") != mat.get("material_hash")
+                    or entry.get("not_after") != mat.get("not_after")):
                 entry["material_hash"] = mat.get("material_hash")
                 entry["not_after"] = mat.get("not_after")
                 changed = True
             if expiring(entry):
                 logger.info("renewing %s (expiring)", domain)
                 res = await acme_renew(domain)
+                if domain not in certs:
+                    continue  # a handler removed this cert during the renew await
                 if res.get("status") == "SUCCESS":
                     entry["last_renewed_at"] = _now_iso()
                     entry["last_error"] = None
@@ -153,8 +163,7 @@ class LESpoke(BaseSpoke):
                                  res.get("message"))
                     changed = True
         if changed:
-            self.ledger.save(state)
-            self._certs = state
+            self.ledger.save(self._certs)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
