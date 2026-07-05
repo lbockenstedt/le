@@ -67,7 +67,7 @@ fi
 
 if [ -d "le/.git" ]; then
     echo "📂 le repository already exists. Updating..."
-    cd le && git pull --rebase --autostash && cd ..
+    cd le && git fetch origin -q && git reset --hard origin/main && cd ..   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
 else
     echo "🌐 Cloning Certificate Management (le) repository..."
     git clone https://github.com/lbockenstedt/le.git
