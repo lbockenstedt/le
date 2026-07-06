@@ -106,6 +106,22 @@ EOF
 # /var/log/lm/lm-le.log (root-owned append file). Root service owns the dir.
 mkdir -p /var/log/lm
 
+# Circular logging: cap /var/log/lm/*.log so it can't fill the disk (copytruncate
+# keeps the inode → the running spoke's O_APPEND FileHandler + systemd stderr
+# keep appending). Belt-and-suspenders alongside logging_setup's RotatingFileHandler.
+cat > /etc/logrotate.d/lm <<'LOGROTATE'
+/var/log/lm/*.log /var/log/client-sim-*.log {
+    su root root
+    size 50M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE
+
 # DNS-provider credentials dir (DNS-01). Root-only; the spoke writes
 # dns-<provider>.ini here at 0600. Secrets — never logged, never committed.
 mkdir -p /etc/lm-le
