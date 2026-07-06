@@ -31,6 +31,17 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+# Accept a bare hub IP/host for --hub (e.g. `--hub 172.16.1.31` == `--hub
+# wss://172.16.1.31:443`). A ws://|wss:// scheme or the "auto" sentinel is left
+# as-is; host:port gets a scheme; a bare host defaults to the unified :443.
+if [ -n "${HUB_URL:-}" ] && [ "$HUB_URL" != "auto" ]; then
+    case "$HUB_URL" in
+        ws://*|wss://*) : ;;
+        *:[0-9]*)       HUB_URL="wss://${HUB_URL}" ;;
+        *)              HUB_URL="wss://${HUB_URL}:443" ;;
+    esac
+fi
+
 if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
     # Keep the default PSK "lm-secret" so the =-attached ExecStart below
     # (--secret=$SPOKE_SECRET) resolves to "lm-secret" at runtime (zero-touch;
