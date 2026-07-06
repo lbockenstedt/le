@@ -167,6 +167,9 @@ EOF
 
 systemctl daemon-reload
 systemctl enable lm-le
+# Start it now (and pick up new code on a re-install). enable alone left the unit
+# inactive until the next reboot, so the spoke never connected to --hub.
+systemctl restart lm-le
 
 echo "🎉 Certificate Management (le) installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
