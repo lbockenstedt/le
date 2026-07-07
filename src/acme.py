@@ -12,6 +12,7 @@ and are NEVER logged. Private keys are read on demand for transport and never
 logged here (the spoke masks them at its command boundary).
 """
 import asyncio
+import functools
 import hashlib
 import logging
 import os
@@ -38,8 +39,10 @@ _PEM_CERT_RE = re.compile(
 
 # ── environment probes ───────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=8)
 def present(bin_path: str = CERTBOT_BIN) -> bool:
-    """True if a certbot binary is on PATH."""
+    """True if a certbot binary is on PATH. Cached — the binary location
+    doesn't change during a spoke's lifetime, and this is probed per issue."""
     return bool(shutil.which(bin_path))
 
 
@@ -61,9 +64,13 @@ _DNS_PLUGIN_APT: Dict[str, str] = {
 }
 
 
+@functools.lru_cache(maxsize=32)
 def dns_plugin_present(provider: str) -> bool:
     """True if the certbot DNS-01 plugin apt package for ``provider`` is
-    installed system-wide (the system certbot loads it, not the venv python)."""
+    installed system-wide (the system certbot loads it, not the venv python).
+    lru_cached — dpkg -s per DNS-01 issue was a wasted subprocess on the hot
+    path. ensure_dns_plugin calls dns_plugin_present.cache_clear() after an
+    apt install so the post-install check sees the new package."""
     pkg = _DNS_PLUGIN_APT.get((provider or "").strip().lower())
     if not pkg:
         return False
@@ -98,6 +105,9 @@ async def ensure_dns_plugin(provider: str) -> Dict[str, Any]:
     if rc != 0:
         return {"status": "ERROR",
                 "message": f"apt install {pkg} failed: {(err or out).strip()[:300]}"}
+    # apt just changed the package set — drop the lru_cache so the post-install
+    # presence check re-runs dpkg instead of returning the stale pre-install hit.
+    dns_plugin_present.cache_clear()
     if not dns_plugin_present(prov):
         return {"status": "ERROR",
                 "message": f"{pkg} installed but dpkg still reports absent — "
@@ -357,16 +367,36 @@ def list_certs(live_dir: str = LE_LIVE_DIR) -> List[Dict[str, Any]]:
     return out
 
 
+# mtime-keyed memo for read_material: the reconcile loop + LE_GET_CERT both
+# call read_material for every cert every cycle, re-reading + re-x509-parsing
+# fullchain.pem each time. Certbot only rewrites the file on issue/renew/revoke
+# (which changes its mtime), so a memo keyed on fullchain's st_mtime reuses the
+# parsed material until the cert actually changes. The material_hash the hub
+# uses for change-detection is derived from fullchain, so an mtime-keyed cache
+# stays consistent with what the hub would see if it re-fetched.
+_read_material_cache: Dict[str, tuple] = {}  # {fullchain_path: (mtime, result)}
+
+
 def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
     """Read a cert's PEM material + hash for hub transport.
 
     Returns {status, fullchain, privkey, chain, material_hash, not_after} or
     {status:ERROR}. privkey is a secret — the caller masks it at the boundary.
+    Memoized on fullchain.pem's mtime (see _read_material_cache).
     """
     d = os.path.join(live_dir, domain)
     fullchain_p = os.path.join(d, "fullchain.pem")
     if not os.path.isfile(fullchain_p):
+        # File gone (revoke/teardown) — drop any stale memo for it.
+        _read_material_cache.pop(fullchain_p, None)
         return {"status": "ERROR", "message": f"no live cert for {domain}"}
+    try:
+        mtime = os.stat(fullchain_p).st_mtime
+    except OSError:
+        mtime = None
+    cached = _read_material_cache.get(fullchain_p)
+    if cached and cached[0] == mtime:
+        return cached[1]
     try:
         with open(fullchain_p, "r") as f:
             fullchain = f.read()
@@ -388,10 +418,13 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
                 chain = f.read()
         except Exception:
             chain = ""
-    return {"status": "SUCCESS", "domain": domain, "fullchain": fullchain,
-            "privkey": privkey, "chain": chain,
-            "material_hash": _hash(fullchain),
-            "not_after": _parse_not_after(fullchain)}
+    result = {"status": "SUCCESS", "domain": domain, "fullchain": fullchain,
+              "privkey": privkey, "chain": chain,
+              "material_hash": _hash(fullchain),
+              "not_after": _parse_not_after(fullchain)}
+    if mtime is not None:
+        _read_material_cache[fullchain_p] = (mtime, result)
+    return result
 
 
 def _hash(pem: str) -> str:
