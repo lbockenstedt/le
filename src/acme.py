@@ -276,6 +276,9 @@ async def issue(domain: str, email: str, challenge: str, *,
 
 
 async def renew(domain: str, *, bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
+    """Renew one cert via ``certbot renew --cert-name <domain>``. Returns
+    ``{status, domain, renewed, live_dir}``; ``renewed`` is False when certbot
+    reports the cert isn't due yet (rc 0, no-op)."""
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
     rc, out, err = await _run(renew_argv(domain, bin_path=bin_path))
@@ -291,6 +294,9 @@ async def renew(domain: str, *, bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
 
 async def revoke(domain: str, *, delete: bool = True,
                  bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
+    """Revoke a cert via ``certbot revoke --cert-name <domain>``. When
+    ``delete`` is True (default) certbot also removes the local material under
+    ``/etc/letsencrypt/live/<domain>/``. Returns ``{status, domain, deleted}``."""
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
     rc, out, err = await _run(revoke_argv(domain, delete=delete, bin_path=bin_path))

@@ -73,15 +73,20 @@ class Ledger:
 
     @staticmethod
     def upsert_cert(state: Dict[str, Any], entry: Dict[str, Any]) -> None:
+        """Insert or replace the ledger entry for ``entry["domain"]``."""
         state.setdefault("certs", {})[entry["domain"]] = entry
 
     @staticmethod
     def remove_cert(state: Dict[str, Any], domain: str) -> bool:
+        """Drop a domain from the ledger; True if it was present."""
         return state.setdefault("certs", {}).pop(domain, None) is not None
 
     @staticmethod
     def add_target(state: Dict[str, Any], domain: str,
                    module_type: str, identifier: str = "") -> Optional[Dict[str, Any]]:
+        """Append a distribution target to a cert's ``targets[]`` (idempotent on
+        ``(module_type, identifier)``). Returns the target dict, or None if the
+        domain isn't in the ledger."""
         cert = state.setdefault("certs", {}).get(domain)
         if cert is None:
             return None
@@ -98,6 +103,9 @@ class Ledger:
 
     @staticmethod
     def remove_target(state: Dict[str, Any], domain: str, idx: int) -> bool:
+        """Remove the target at positional index ``idx`` from a cert's
+        ``targets[]``. Returns True if removed, False if the cert or index
+        doesn't exist."""
         cert = state.setdefault("certs", {}).get(domain)
         if cert is None:
             return False

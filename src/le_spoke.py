@@ -197,6 +197,8 @@ class LESpoke(BaseSpoke):
     # ── BaseSpoke contract ────────────────────────────────────────────────────
 
     async def get_status(self) -> Dict[str, Any]:
+        """Module status for the WebUI/hub: version, ``certbot_present``, and
+        the number of certs currently managed in the ledger."""
         return {
             "status": "SUCCESS",
             "data": {
@@ -210,6 +212,11 @@ class LESpoke(BaseSpoke):
 
     async def handle_command(self, command_type: str,
                              data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a hub ``LE_*`` command. Returns the standard spoke contract
+        ``{"status": "SUCCESS", "data": ...}`` or ``{"status": "ERROR", ...}``.
+        Long-running certbot work is awaited as an async subprocess so the event
+        loop stays responsive; ``privkey`` material is returned for distribution
+        but masked at the log boundary."""
         cmd = (command_type or "").upper()
         data = data or {}
         logger.info("Handling LE command: %s", cmd)
