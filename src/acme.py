@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -138,6 +139,35 @@ def write_dns_creds(provider: str, content: str,
     return path
 
 
+def resolve_rfc2136_server(content: str) -> str:
+    """certbot-dns-rfc2136 requires ``dns_rfc2136_server`` to be a literal IP —
+    a hostname is rejected ("not a valid IPv4 or IPv6 address"). Resolve a
+    hostname value to an IP in place; leave an already-numeric address (or an
+    unresolvable value) untouched so certbot surfaces its own clear error. The
+    secret lines are never touched/logged."""
+    def _is_ip(v: str) -> bool:
+        for fam in (socket.AF_INET, socket.AF_INET6):
+            try:
+                socket.inet_pton(fam, v)
+                return True
+            except OSError:
+                continue
+        return False
+
+    def _repl(m):
+        prefix, val = m.group(1), m.group(2).strip()
+        if not val or _is_ip(val):
+            return m.group(0)
+        try:
+            ip = socket.getaddrinfo(val, None)[0][4][0]
+            logger.info("rfc2136: resolved DNS server %s -> %s for certbot", val, ip)
+            return f"{prefix}{ip}"
+        except Exception as e:  # noqa: BLE001 — leave as-is; certbot errors clearly
+            logger.warning("rfc2136: could not resolve DNS server '%s': %s", val, e)
+            return m.group(0)
+    return re.sub(r"(?m)^(\s*dns_rfc2136_server\s*=\s*)(\S+)\s*$", _repl, content)
+
+
 # ── argv builders (pure) ─────────────────────────────────────────────────────
 
 def _normalize_challenge(challenge: str) -> str:
@@ -255,6 +285,9 @@ async def issue(domain: str, email: str, challenge: str, *,
     ini = dns_creds_ini
     if _normalize_challenge(challenge) == "dns":
         if dns_creds and not ini:
+            # certbot-dns-rfc2136 rejects a hostname server — resolve it to an IP.
+            if "dns_rfc2136_server" in dns_creds:
+                dns_creds = resolve_rfc2136_server(dns_creds)
             ini = write_dns_creds(dns_provider, dns_creds)
         # On-demand install of the DNS-01 plugin for providers not
         # preinstalled by the installer (cloudflare/route53 are). Best-effort;
