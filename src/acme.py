@@ -20,6 +20,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("LEAcme")
@@ -139,6 +140,29 @@ def write_dns_creds(provider: str, content: str,
     return path
 
 
+# Hurricane Electric ACCOUNT-LOGIN provider (email/password web panel, no TSIG).
+# Not a certbot DNS plugin — driven by the built-in ``manual`` authenticator with
+# he_dns.py as the auth/cleanup hook (see issue_argv).
+HE_LOGIN_PROVIDER = "he-login"
+_HE_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "he_dns.py")
+
+
+def write_he_creds(username: str, password: str,
+                   creds_dir: str = DNS_CREDS_DIR) -> str:
+    """Persist Hurricane Electric account creds at 0600 for the DNS hook — read
+    by he_dns.py on both issue AND renewal (certbot re-runs the hook with no env,
+    so the file is the durable source). Never logged."""
+    os.makedirs(creds_dir, exist_ok=True)
+    path = os.path.join(creds_dir, "he-login.ini")
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"HE_USERNAME={username}\nHE_PASSWORD={password}\n")
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return path
+
+
 def resolve_rfc2136_server(content: str) -> str:
     """certbot-dns-rfc2136 requires ``dns_rfc2136_server`` to be a literal IP —
     a hostname is rejected ("not a valid IPv4 or IPv6 address"). Resolve a
@@ -215,11 +239,19 @@ def issue_argv(domain: str, email: str, challenge: str, *,
     elif ch == "dns":
         if not dns_provider:
             raise ValueError("dns challenge requires dns_provider")
-        argv += [f"--dns-{dns_provider}"]
-        if dns_creds_ini:
-            argv += [f"--dns-{dns_provider}-credentials", dns_creds_ini]
-        argv += [f"--dns-{dns_provider}-propagation-seconds",
-                 str(propagation_seconds)]
+        if dns_provider == HE_LOGIN_PROVIDER:
+            # Hurricane Electric account login → built-in manual authenticator
+            # with he_dns.py setting/removing the _acme-challenge TXT via the HE
+            # web panel. No --dns-<provider> plugin, no credentials INI.
+            argv += ["--manual",
+                     "--manual-auth-hook", f"{sys.executable} {_HE_HOOK} auth",
+                     "--manual-cleanup-hook", f"{sys.executable} {_HE_HOOK} cleanup"]
+        else:
+            argv += [f"--dns-{dns_provider}"]
+            if dns_creds_ini:
+                argv += [f"--dns-{dns_provider}-credentials", dns_creds_ini]
+            argv += [f"--dns-{dns_provider}-propagation-seconds",
+                     str(propagation_seconds)]
     # tls-alpn: no extra argv — whatever authenticator plugin is installed on
     # the host picks up the challenge from --preferred-challenges above.
     if staging:
@@ -270,6 +302,7 @@ def _ok(rc: int) -> bool:
 async def issue(domain: str, email: str, challenge: str, *,
                 webroot: Optional[str] = None, dns_provider: Optional[str] = None,
                 dns_creds: Optional[str] = None, dns_creds_ini: Optional[str] = None,
+                he_username: Optional[str] = None, he_password: Optional[str] = None,
                 staging: bool = False, key_type: str = "rsa",
                 cert_name: Optional[str] = None,
                 propagation_seconds: int = _PROPAGATION_DEFAULT,
@@ -278,24 +311,34 @@ async def issue(domain: str, email: str, challenge: str, *,
 
     For DNS-01, pass either ``dns_creds`` (raw INI content — written to
     /etc/lm-le/dns-<provider>.ini at 0600) or ``dns_creds_ini`` (an existing
-    path). The raw creds are a secret and never logged.
+    path). For ``dns_provider == "he-login"`` (Hurricane Electric account login),
+    pass ``he_username``/``he_password`` (else the stored knob's he-login.ini is
+    used). All secrets are 0600 and never logged.
     """
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
     ini = dns_creds_ini
     if _normalize_challenge(challenge) == "dns":
-        if dns_creds and not ini:
-            # certbot-dns-rfc2136 rejects a hostname server — resolve it to an IP.
-            if "dns_rfc2136_server" in dns_creds:
-                dns_creds = resolve_rfc2136_server(dns_creds)
-            ini = write_dns_creds(dns_provider, dns_creds)
-        # On-demand install of the DNS-01 plugin for providers not
-        # preinstalled by the installer (cloudflare/route53 are). Best-effort;
-        # a failure here surfaces a clear message instead of a certbot traceback.
-        plug = await ensure_dns_plugin(dns_provider)
-        if plug.get("status") != "SUCCESS":
-            return {"status": "ERROR",
-                    "message": f"DNS plugin unavailable: {plug.get('message')}"}
+        if dns_provider == HE_LOGIN_PROVIDER:
+            # Account-login HE uses the built-in manual authenticator + he_dns.py
+            # hook (no DNS plugin to install). Persist any per-request creds so the
+            # hook — and future renewals — can read them; otherwise rely on the
+            # creds file the setup knob already wrote.
+            if he_username and he_password:
+                write_he_creds(he_username, he_password)
+        else:
+            if dns_creds and not ini:
+                # certbot-dns-rfc2136 rejects a hostname server — resolve to an IP.
+                if "dns_rfc2136_server" in dns_creds:
+                    dns_creds = resolve_rfc2136_server(dns_creds)
+                ini = write_dns_creds(dns_provider, dns_creds)
+            # On-demand install of the DNS-01 plugin for providers not
+            # preinstalled by the installer (cloudflare/route53 are). Best-effort;
+            # a failure here surfaces a clear message instead of a certbot traceback.
+            plug = await ensure_dns_plugin(dns_provider)
+            if plug.get("status") != "SUCCESS":
+                return {"status": "ERROR",
+                        "message": f"DNS plugin unavailable: {plug.get('message')}"}
     argv = issue_argv(domain, email, challenge, webroot=webroot,
                       dns_provider=dns_provider, dns_creds_ini=ini,
                       staging=staging, key_type=key_type, cert_name=cert_name,

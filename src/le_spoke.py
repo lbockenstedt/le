@@ -27,6 +27,7 @@ from acme import (  # type: ignore[import-not-found]
     renew as acme_renew,
     issue as acme_issue,
     revoke as acme_revoke,
+    write_he_creds,
 )
 from ledger import Ledger  # type: ignore[import-not-found]
 
@@ -283,6 +284,31 @@ class LESpoke(BaseSpoke):
         if cmd == "LE_MARK_DISTRIBUTED":
             return self._mark_distributed(data)
 
+        if cmd == "LE_SET_HE_LOGIN":
+            # Persistent Hurricane Electric account-login knob: store the creds in
+            # config AND to the durable 0600 file the DNS hook reads (issue +
+            # unattended renewals). Empty password clears it.
+            he_u = (data.get("he_username") or "").strip()
+            he_p = data.get("he_password") or ""
+            if not he_u or not he_p:
+                return {"status": "ERROR",
+                        "message": "he_username and he_password are required"}
+            self.config["he_username"] = he_u
+            self.config["he_password"] = he_p
+            try:
+                write_he_creds(he_u, he_p)
+            except Exception as e:  # noqa: BLE001
+                return {"status": "ERROR", "message": f"failed to store HE creds: {e}"}
+            return {"status": "SUCCESS", "message": "Hurricane Electric login stored"}
+
+        if cmd == "LE_GET_HE_LOGIN":
+            # Report configuration status WITHOUT returning the password.
+            u = self.config.get("he_username") or ""
+            import os as _os
+            configured = bool(u) or _os.path.exists(
+                _os.getenv("LM_LE_HE_CREDS", "/etc/lm-le/he-login.ini"))
+            return {"status": "SUCCESS", "configured": configured, "he_username": u}
+
         if cmd == "UPDATE_CONFIG":
             self.config = data
             if "renew_interval" in data:
@@ -291,6 +317,14 @@ class LESpoke(BaseSpoke):
                     self._start_renew_loop()
                 except (TypeError, ValueError):
                     pass
+            # Persist the Hurricane Electric account-login knob so the DNS hook
+            # (issue + unattended renewals) can read it without per-request creds.
+            he_u, he_p = data.get("he_username"), data.get("he_password")
+            if he_u and he_p:
+                try:
+                    write_he_creds(he_u, he_p)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("failed to persist HE login creds: %s", e)
             return {"status": "SUCCESS", "message": "le configuration updated from hub"}
 
         if cmd == "GET_VERSION":
@@ -325,6 +359,10 @@ class LESpoke(BaseSpoke):
                 dns_provider=data.get("dns_provider"),
                 dns_creds=data.get("dns_creds"),
                 dns_creds_ini=data.get("dns_creds_ini"),
+                # HE account-login creds: per-request wins, else the stored knob
+                # (self.config, set via UPDATE_CONFIG).
+                he_username=data.get("he_username") or self.config.get("he_username"),
+                he_password=data.get("he_password") or self.config.get("he_password"),
                 staging=bool(data.get("staging", False)),
                 key_type=data.get("key_type", "rsa"),
             )
