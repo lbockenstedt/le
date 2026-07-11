@@ -89,8 +89,9 @@ class LESpoke(BaseSpoke):
 
         super().__init__(spoke_id, config)
         self._start_renew_loop()
-        logger.info("LESpoke initialized [%s] (%d managed cert(s))",
-                    spoke_id, len(self._certs.get("certs", {})))
+        logger.info("LESpoke initialized [%s] v%s BUILD-MARKER-DNSCRED "
+                    "(LE_SET_DNS_CRED/LE_LIST_DNS_CREDS handlers active) — %d managed cert(s)",
+                    spoke_id, _read_version(), len(self._certs.get("certs", {})))
 
     # ── renewal loop (opnsense __init__-create_task pattern) ──────────────────
 
