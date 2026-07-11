@@ -30,6 +30,7 @@ from acme import (  # type: ignore[import-not-found]
     write_he_creds,
 )
 from ledger import Ledger  # type: ignore[import-not-found]
+import dns_credentials  # type: ignore[import-not-found]  # per-tenant DNS-01 credential store
 
 # BaseSpoke lives in the lm core (on PYTHONPATH in production). A standalone
 # fallback keeps the spoke + its tests importable without the lm core checkout.
@@ -284,6 +285,32 @@ class LESpoke(BaseSpoke):
         if cmd == "LE_MARK_DISTRIBUTED":
             return self._mark_distributed(data)
 
+        # ── Per-tenant multi-provider DNS-01 credential store ──────────────────
+        if cmd == "LE_LIST_DNS_CREDS":
+            tid = data.get("tenant_id") or "default"
+            return {"status": "SUCCESS", "credentials": dns_credentials.list_public(tid),
+                    "providers": list(dns_credentials.PROVIDERS),
+                    "provider_fields": dns_credentials.PROVIDER_FIELDS}
+
+        if cmd == "LE_SET_DNS_CRED":
+            tid = data.get("tenant_id") or "default"
+            try:
+                dns_credentials.upsert(tid, data.get("name") or "",
+                                       data.get("provider") or "",
+                                       data.get("fields") or {})
+            except ValueError as e:
+                return {"status": "ERROR", "message": str(e)}
+            except Exception as e:  # noqa: BLE001
+                return {"status": "ERROR", "message": f"failed to store credential: {e}"}
+            return {"status": "SUCCESS", "message": "DNS credential saved"}
+
+        if cmd == "LE_DELETE_DNS_CRED":
+            tid = data.get("tenant_id") or "default"
+            ok = dns_credentials.delete(tid, data.get("name") or "")
+            if not ok:
+                return {"status": "ERROR", "message": "credential not found"}
+            return {"status": "SUCCESS", "message": "DNS credential deleted"}
+
         if cmd == "LE_SET_HE_LOGIN":
             # Persistent Hurricane Electric account-login knob: store the creds in
             # config AND to the durable 0600 file the DNS hook reads (issue +
@@ -352,17 +379,31 @@ class LESpoke(BaseSpoke):
             return {"status": "ERROR", "message": "LE_ISSUE_CERT requires 'domain'"}
         email = data.get("email") or ""
         challenge = data.get("challenge", "http")
+        # Named per-tenant DNS credential (multi-tenant store). When the request
+        # names one, materialize it for THIS tenant and let it supply the provider
+        # + secrets; an explicit per-request dns_provider/creds still wins if given.
+        tenant_id = data.get("tenant_id") or "default"
+        cred_name = data.get("dns_credential")
+        mat: Dict[str, Any] = {}
+        if cred_name:
+            try:
+                mat = dns_credentials.materialize(tenant_id, cred_name)
+            except KeyError as e:
+                return {"status": "ERROR", "message": str(e)}
+            except Exception as e:  # noqa: BLE001
+                return {"status": "ERROR", "message": f"DNS credential error: {e}"}
         try:
             res = await acme_issue(
                 domain, email, challenge,
                 webroot=data.get("webroot"),
-                dns_provider=data.get("dns_provider"),
-                dns_creds=data.get("dns_creds"),
+                dns_provider=data.get("dns_provider") or mat.get("dns_provider"),
+                dns_creds=data.get("dns_creds") or mat.get("dns_creds"),
                 dns_creds_ini=data.get("dns_creds_ini"),
-                # HE account-login creds: per-request wins, else the stored knob
-                # (self.config, set via UPDATE_CONFIG).
-                he_username=data.get("he_username") or self.config.get("he_username"),
-                he_password=data.get("he_password") or self.config.get("he_password"),
+                # HE account-login creds: per-request wins, else the named
+                # credential, else the legacy single knob (self.config).
+                he_username=data.get("he_username") or mat.get("he_username") or self.config.get("he_username"),
+                he_password=data.get("he_password") or mat.get("he_password") or self.config.get("he_password"),
+                route53_env=mat.get("route53_env"),
                 staging=bool(data.get("staging", False)),
                 key_type=data.get("key_type", "rsa"),
             )
@@ -375,7 +416,9 @@ class LESpoke(BaseSpoke):
             "domain": domain,
             "email": email,
             "challenge": challenge,
-            "dns_provider": data.get("dns_provider"),
+            "dns_provider": data.get("dns_provider") or mat.get("dns_provider"),
+            "dns_credential": cred_name,
+            "tenant_id": tenant_id,
             "staging": bool(data.get("staging", False)),
             "not_after": mat.get("not_after") if mat.get("status") == "SUCCESS" else None,
             "material_hash": mat.get("material_hash") if mat.get("status") == "SUCCESS" else None,

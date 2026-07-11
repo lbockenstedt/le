@@ -274,14 +274,17 @@ def revoke_argv(domain: str, *, delete: bool = True,
 
 # ── subprocess runner ─────────────────────────────────────────────────────────
 
-async def _run(argv: List[str], timeout: float = 180.0) -> Tuple[int, str, str]:
+async def _run(argv: List[str], timeout: float = 180.0,
+               env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
     """Run argv, return (returncode, stdout, stderr). On timeout, kill + return
-    a synthetic -1 with a timeout message."""
+    a synthetic -1 with a timeout message. ``env`` (e.g. route53 AWS creds) is
+    merged onto the current environment — its values are never logged."""
     logger.info("acme run: %s", " ".join(argv))
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=({**os.environ, **env} if env else None),
     )
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(),
@@ -303,6 +306,7 @@ async def issue(domain: str, email: str, challenge: str, *,
                 webroot: Optional[str] = None, dns_provider: Optional[str] = None,
                 dns_creds: Optional[str] = None, dns_creds_ini: Optional[str] = None,
                 he_username: Optional[str] = None, he_password: Optional[str] = None,
+                route53_env: Optional[Dict[str, str]] = None,
                 staging: bool = False, key_type: str = "rsa",
                 cert_name: Optional[str] = None,
                 propagation_seconds: int = _PROPAGATION_DEFAULT,
@@ -343,7 +347,9 @@ async def issue(domain: str, email: str, challenge: str, *,
                       dns_provider=dns_provider, dns_creds_ini=ini,
                       staging=staging, key_type=key_type, cert_name=cert_name,
                       propagation_seconds=propagation_seconds, bin_path=bin_path)
-    rc, out, err = await _run(argv)
+    # route53 has no --dns-route53-credentials file; certbot-dns-route53 reads
+    # AWS creds from the environment, passed through per-issue (never logged).
+    rc, out, err = await _run(argv, env=route53_env or None)
     if not _ok(rc):
         return {"status": "ERROR",
                 "message": (err or out or f"certbot exited {rc}").strip()[:500]}
