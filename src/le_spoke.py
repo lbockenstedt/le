@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional
 
 from acme import (  # type: ignore[import-not-found]
     expiring,
-    list_certs,
     present as certbot_present,
     read_material,
     renew as acme_renew,
