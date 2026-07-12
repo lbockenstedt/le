@@ -156,6 +156,35 @@ def test_expiring_no_not_after():
     assert acme.expiring({"not_after": None}) is False
 
 
+def test_expiring_default_window_is_7_days():
+    """Default renewal window is 7 days (was 30). A cert 10 days out is NOT
+    expiring; a cert 5 days out IS. Guards the default bump."""
+    from datetime import datetime, timedelta, timezone
+    ten = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+    five = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    assert acme.expiring({"not_after": ten}) is False
+    assert acme.expiring({"not_after": five}) is True
+
+
+def test_expiring_per_cert_override_wins():
+    """A per-cert renew_window_days overrides the default — an operator who
+    wants this cert renewed earlier (e.g. 14 days) gets it even though the
+    default is 7. 10 days out → expiring under a 14-day window but not under 7."""
+    from datetime import datetime, timedelta, timezone
+    ten = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+    assert acme.expiring({"not_after": ten, "renew_window_days": 14}) is True
+    assert acme.expiring({"not_after": ten}) is False  # default 7 → not expiring
+
+
+def test_expiring_per_cert_override_smaller_than_default():
+    """A per-cert override SMALLER than the default (e.g. 3 days) is honored —
+    5 days out is expiring under the 7-day default but NOT under a 3-day override."""
+    from datetime import datetime, timedelta, timezone
+    five = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    assert acme.expiring({"not_after": five, "renew_window_days": 3}) is False
+    assert acme.expiring({"not_after": five}) is True  # default 7 → expiring
+
+
 # ── write_dns_creds ──────────────────────────────────────────────────────────
 
 def test_write_dns_creds_mode_and_content():

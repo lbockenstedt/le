@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from acme import (  # type: ignore[import-not-found]
     expiring,
+    _RENEW_WINDOW_DAYS,
     present as certbot_present,
     read_material,
     renew as acme_renew,
@@ -177,6 +178,13 @@ class LESpoke(BaseSpoke):
         Ensures required keys exist for the UI/hub."""
         e = dict(entry)
         e.setdefault("targets", [])
+        # renew_window_days: None → the module default (7). Surface the EFFECTIVE
+        # value as renew_window_days_effective so the UI can show "renews N days
+        # before expiry" without re-deriving the default. Keep the raw stored
+        # value (None = default) for round-tripping edits.
+        e.setdefault("renew_window_days", None)
+        e["renew_window_days_effective"] = (e["renew_window_days"]
+                                            if e["renew_window_days"] else _RENEW_WINDOW_DAYS)
         return e
 
     async def _notify_renewed(self, domain: str, entry: Dict[str, Any]) -> None:
@@ -412,6 +420,17 @@ class LESpoke(BaseSpoke):
         if res.get("status") != "SUCCESS":
             return res
         mat = read_material(domain)
+        # Per-cert renewal window (days before expiry the loop triggers). Default
+        # 7 (acme._RENEW_WINDOW_DAYS); operator can override at issue time. None
+        # → expiring() falls back to the module default. Validated to a positive
+        # int so a bad value can't disable renewal (None is "use default").
+        rwd = data.get("renew_window_days")
+        try:
+            rwd = int(rwd) if rwd not in (None, "") else None
+            if rwd is not None and rwd <= 0:
+                rwd = None
+        except (TypeError, ValueError):
+            rwd = None
         entry: Dict[str, Any] = {
             "domain": domain,
             "email": email,
@@ -422,6 +441,7 @@ class LESpoke(BaseSpoke):
             "staging": bool(data.get("staging", False)),
             "not_after": mat.get("not_after") if mat.get("status") == "SUCCESS" else None,
             "material_hash": mat.get("material_hash") if mat.get("status") == "SUCCESS" else None,
+            "renew_window_days": rwd,
             "targets": [],
             "last_renewed_at": None,
             "last_error": None,
@@ -439,6 +459,7 @@ class LESpoke(BaseSpoke):
             "domain": domain, "action": "issue",
             "material_hash": saved.get("material_hash"),
             "not_after": saved.get("not_after"),
+            "renew_window_days": saved.get("renew_window_days"),
             "targets": saved.get("targets", [])}}
 
     async def _renew(self, data: Dict[str, Any]) -> Dict[str, Any]:

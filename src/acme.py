@@ -31,7 +31,7 @@ LE_CONFIG_DIR = os.getenv("LM_LE_CONFIG_DIR", "/etc/letsencrypt")
 DNS_CREDS_DIR = os.getenv("LM_LE_DNS_CREDS_DIR", "/etc/lm-le")
 CERTBOT_BIN = os.getenv("LM_LE_CERTBOT_BIN", "certbot")
 _PROPAGATION_DEFAULT = 60
-_RENEW_WINDOW_DAYS = 30  # renew when not_after is within this many days
+_RENEW_WINDOW_DAYS = 7  # renew when not_after is within this many days (default; per-cert override via entry["renew_window_days"])
 
 _PEM_CERT_RE = re.compile(
     r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
@@ -520,11 +520,24 @@ def _hash(pem: str) -> str:
 
 
 def expiring(cert_entry: Dict[str, Any], now_iso: Optional[str] = None,
-             window_days: int = _RENEW_WINDOW_DAYS) -> bool:
-    """True if a ledger/live cert entry's not_after is within window_days."""
+             window_days: Optional[int] = None) -> bool:
+    """True if a ledger/live cert entry's not_after is within the renewal
+    window. The window is resolved per-cert, in priority order:
+
+    1. ``cert_entry["renew_window_days"]`` — a per-cert override set at issue
+       time (operator wants this cert renewed earlier/later than the default).
+    2. ``window_days`` — an explicit caller override (legacy/programmatic).
+    3. ``_RENEW_WINDOW_DAYS`` — the module default (7 days).
+
+    Default 7 days: the renewal loop triggers at least a week before expiry so
+    a failed renewal has ~7 daily retries before the cert actually expires.
+    """
     na = cert_entry.get("not_after")
     if not na:
         return False
+    wd = cert_entry.get("renew_window_days")
+    if wd is None or wd == "":
+        wd = window_days if window_days is not None else _RENEW_WINDOW_DAYS
     try:
         from datetime import datetime, timedelta, timezone
         # Normalize: tolerate trailing Z / naive.
@@ -536,6 +549,6 @@ def expiring(cert_entry: Dict[str, Any], now_iso: Optional[str] = None,
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         ref = datetime.now(timezone.utc)
-        return dt - ref <= timedelta(days=window_days)
+        return dt - ref <= timedelta(days=wd)
     except Exception:
         return False

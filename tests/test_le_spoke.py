@@ -130,6 +130,45 @@ def test_issue_success_seeds_targets_and_ledger(tmp_path, monkeypatch):
     assert cert["not_after"] == _NOTAFTER
 
 
+def test_issue_renews_window_days_stored_and_listed(tmp_path, monkeypatch):
+    """A per-cert renew_window_days from the issue request is stored on the
+    ledger entry, returned by LE_ISSUE_CERT, and surfaced by LE_LIST_CERTS
+    (renew_window_days_effective resolves None → the 7-day default)."""
+    spoke = _spoke(tmp_path, monkeypatch)
+    res = _cmd(spoke, "LE_ISSUE_CERT", {
+        "domain": "example.com", "email": "a@b.com", "challenge": "http",
+        "renew_window_days": 14})
+    assert res["status"] == "SUCCESS"
+    assert res["data"]["renew_window_days"] == 14
+    cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert cert["renew_window_days"] == 14
+    assert cert["renew_window_days_effective"] == 14
+
+
+def test_issue_renew_window_days_defaults_to_none(tmp_path, monkeypatch):
+    """No renew_window_days in the request → stored None → effective = 7-day
+    default (so a cert issued without the field still renews at 7 days)."""
+    spoke = _spoke(tmp_path, monkeypatch)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert cert["renew_window_days"] is None
+    assert cert["renew_window_days_effective"] == 7
+
+
+def test_issue_renew_window_days_bad_value_falls_back(tmp_path, monkeypatch):
+    """A non-positive / non-int renew_window_days is normalized to None (use
+    default) so a bad value can't disable renewal or crash the loop."""
+    spoke = _spoke(tmp_path, monkeypatch)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "a.com", "challenge": "http",
+                                  "renew_window_days": 0})
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "b.com", "challenge": "http",
+                                  "renew_window_days": "soon"})
+    certs = {c["domain"]: c for c in _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"]}
+    assert certs["a.com"]["renew_window_days"] is None
+    assert certs["b.com"]["renew_window_days"] is None
+    assert certs["a.com"]["renew_window_days_effective"] == 7
+
+
 def test_issue_failure_returns_error(tmp_path, monkeypatch):
     _install_acme_mocks(monkeypatch, issue_status="ERROR")
     cfg = {"ledger_path": str(tmp_path / "certs.json")}
