@@ -16,6 +16,9 @@ masked at the command boundary; ``LE_GET_CERT`` returns it for transport only.
 import asyncio
 import logging
 import os
+import ssl
+import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -53,6 +56,14 @@ logger = logging.getLogger("LESpoke")
 _DEFAULT_LEDGER_DIR = "/var/lib/lm"
 _RENEW_INTERVAL_DEFAULT = 86400  # daily
 _RENEW_BACKOFF = 60
+
+# Cert-install helper the spoke drives the dumb Agent to run (WRITE_FILE two
+# 0600 temps → RUN_COMMAND this helper). Role-provisioned on the cert-target
+# box (analogous to netbox-server provisioning lm-netbox-install-cert). Contract:
+# `lm-le-install-cert <domain> <crt-tmp> <key-tmp>` prints `OK <msg>` on success
+# / exits nonzero with stderr on failure. Override for non-default paths.
+_LE_INSTALL_CERT_HELPER = os.getenv("LM_LE_INSTALL_CERT_HELPER",
+                                    "/usr/local/bin/lm-le-install-cert")
 
 
 def _read_version() -> str:
@@ -293,6 +304,10 @@ class LESpoke(BaseSpoke):
         if cmd == "LE_MARK_DISTRIBUTED":
             return self._mark_distributed(data)
 
+        # ── Agent-host cert deploy (dumb Agent on a cert-target box) ───────────
+        if cmd == "LE_DEPLOY_TO_AGENT":
+            return await self._deploy_to_agent_command(data)
+
         # ── Per-tenant multi-provider DNS-01 credential store ──────────────────
         if cmd == "LE_LIST_DNS_CREDS":
             tid = data.get("tenant_id") or "default"
@@ -528,3 +543,187 @@ class LESpoke(BaseSpoke):
                 self._persist()
                 return {"status": "SUCCESS", "data": {"domain": domain, "target": t}}
         return {"status": "ERROR", "message": "target not found for distribution ack"}
+
+    # ── Agent-host cert deploy (dumb Agent on a cert-target box) ───────────────
+    # The le spoke brokers cert material to *spoke* targets through the hub (the
+    # existing ledger `targets` flow, untouched). This is the ADDITIONAL path for
+    # cert-target boxes that have no spoke module — a dumb device-mode Agent
+    # dials this spoke's /ws/agent listener and the spoke drives it to install a
+    # cert via WRITE_FILE + RUN_COMMAND (the netbox cert-custodian pattern).
+
+    def _validate_cert_pair(self, fullchain: str, privkey: str):
+        """Validate PEM shape + that the cert+key form a usable TLS pair, in
+        process (0600 temps) before the material can reach any live host. Same
+        guard netbox + the hub use. Returns None on success or an ERROR dict."""
+        if not fullchain or not privkey:
+            return {"status": "ERROR", "message": "missing cert material"}
+        if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
+            return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
+        crt_tmp = key_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".crt.pem",
+                                              delete=False) as cf:
+                cf.write(fullchain); crt_tmp = cf.name
+            with tempfile.NamedTemporaryFile("w", suffix=".key.pem",
+                                              delete=False) as kf:
+                kf.write(privkey); key_tmp = kf.name
+            os.chmod(crt_tmp, 0o600); os.chmod(key_tmp, 0o600)
+            try:
+                ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(
+                    crt_tmp, key_tmp)
+            except Exception as e:  # noqa: BLE001
+                return {"status": "ERROR", "message": f"cert validation failed: {e}"}
+        finally:
+            for p in (crt_tmp, key_tmp):
+                if p:
+                    try: os.unlink(p)
+                    except OSError: pass
+        return None
+
+    async def _deploy_cert_to_agent(self, agent_id, fullchain, privkey, domain):
+        """Drive the dumb Agent to install a cert: WRITE_FILE crt + key to 0600
+        temps, then RUN_COMMAND the role-provisioned install helper (which places
+        the cert + reloads the configured service). The Agent runs; the spoke
+        holds the sequence. Mirrors netbox_spoke._deploy_cert_to_agent."""
+        cp = self.control_plane
+        if cp is None or not hasattr(cp, "send_to_agent"):
+            return {"status": "ERROR", "message": "spoke is not an agent host"}
+        ts = str(int(time.time() * 1000))
+        crt_tmp = f"/tmp/lm-le-{ts}.crt.pem"
+        key_tmp = f"/tmp/lm-le-{ts}.key.pem"
+        try:
+            await cp.send_to_agent("WRITE_FILE",
+                                   {"path": crt_tmp, "content": fullchain,
+                                    "mode": 0o600}, agent_id=agent_id, timeout=20.0)
+            await cp.send_to_agent("WRITE_FILE",
+                                   {"path": key_tmp, "content": privkey,
+                                    "mode": 0o600}, agent_id=agent_id, timeout=20.0)
+            cmd = f"sudo -n {_LE_INSTALL_CERT_HELPER} {domain} {crt_tmp} {key_tmp}"
+            res = await cp.send_to_agent("RUN_COMMAND",
+                                         {"command": cmd, "allow_shell": True,
+                                          "timeout": 30}, agent_id=agent_id,
+                                        timeout=40.0)
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": f"deploy to agent {agent_id}: {e}"}
+        finally:
+            try:
+                await cp.send_to_agent("RUN_COMMAND",
+                                       {"command": f"rm -f {crt_tmp} {key_tmp}",
+                                        "allow_shell": True, "timeout": 10},
+                                       agent_id=agent_id, timeout=15.0)
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
+        runner = (res or {}).get("result", {}) if isinstance(res, dict) else {}
+        out = (runner.get("stdout") or "").strip()
+        if runner.get("rc") == 0 and out.startswith("OK"):
+            logger.info("[cert] %s → le agent %s: installed — %s",
+                        domain, agent_id, out[2:].strip() or out)
+            return {"status": "SUCCESS",
+                     "message": out[2:].strip() or "installed on agent"}
+        msg = (runner.get("stderr") or out or (res or {}).get("message")
+               or "cert helper failed on agent")
+        logger.warning("[cert] %s → le agent %s: FAILED — %s",
+                       domain, agent_id, msg)
+        return {"status": "ERROR", "message": msg}
+
+    async def deploy_cert_to_agent(self, domain, fullchain, privkey, agent_id):
+        """Validate a cert pair and deploy it to one connected Agent (explicit
+        operator trigger via LE_DEPLOY_TO_AGENT). Reads no ledger state — the
+        caller picks the cert + the agent. Returns the install result."""
+        err = self._validate_cert_pair(fullchain, privkey)
+        if err:
+            return err
+        return await self._deploy_cert_to_agent(agent_id, fullchain, privkey,
+                                                 domain)
+
+    async def _agent_hostname(self, agent_id):
+        """Resolve a connected Agent's hostname (for the ledger target match).
+        Falls back to agent_id when the rec is gone or the spoke isn't an agent
+        host (tests / standalone)."""
+        cp = self.control_plane
+        rec = getattr(cp, "connected_agents", {}).get(agent_id) if cp else None
+        return (rec or {}).get("hostname") or agent_id
+
+    async def deploy_cached_cert_to_agent(self, agent_id):
+        """Auto-deploy on Agent connect: for each managed cert whose ledger has
+        an ``agent`` target matching this Agent's hostname (identifier == "" means
+        any Agent), read the cert material from disk and deploy it. Best-effort —
+        a failed deploy for one cert doesn't block the others. Called from
+        LEControlPlane._on_agent_registered (mirrors netbox's custodian push)."""
+        cp = self.control_plane
+        if cp is None or not getattr(cp, "connected_agents", {}).get(agent_id):
+            return  # agent gone / not an agent host — nothing to push
+        hostname = await self._agent_hostname(agent_id)
+        deployed = 0
+        for domain, entry in list(self._certs.get("certs", {}).items()):
+            for t in entry.get("targets", []):
+                if t.get("module_type") != "agent":
+                    continue
+                ident = (t.get("identifier") or "").strip()
+                if ident and ident != hostname:
+                    continue  # target is for a different host
+                mat = read_material(domain)
+                if mat.get("status") != "SUCCESS":
+                    logger.warning("[cert] skip auto-deploy %s → agent %s: "
+                                   "material unreadable", domain, agent_id)
+                    break
+                logger.info("[cert] auto-deploy %s → le agent %s (host %s)",
+                            domain, agent_id, hostname)
+                res = await self._deploy_cert_to_agent(
+                    agent_id, mat.get("fullchain", ""), mat.get("privkey", ""),
+                    domain)
+                # Record the push in the ledger (same shape as LE_MARK_DISTRIBUTED).
+                t["last_pushed_hash"] = mat.get("material_hash")
+                t["last_pushed_at"] = _now_iso()
+                t["last_status"] = res.get("status")
+                t["last_message"] = res.get("message") or res.get("data", {}).get("message")
+                if res.get("status") == "SUCCESS":
+                    deployed += 1
+                break  # one agent target per cert is enough; don't double-deploy
+        if deployed:
+            self._persist()
+            logger.info("[cert] auto-deploy to agent %s: %d cert(s) installed",
+                        agent_id, deployed)
+
+    async def _deploy_to_agent_command(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """LE_DEPLOY_TO_AGENT: deploy a managed cert's current material to a
+        connected Agent now. ``domain`` required; ``agent_id`` optional (defaults
+        to the first connected Agent). Reads material from disk so a renewed cert
+        is current. Records the agent as an ``agent`` ledger target + marks the
+        push (so the auto-deploy-on-connect path is idempotent for this host)."""
+        domain = data.get("domain")
+        if not domain:
+            return {"status": "ERROR", "message": "LE_DEPLOY_TO_AGENT requires 'domain'"}
+        mat = read_material(domain)
+        if mat.get("status") != "SUCCESS":
+            return mat  # {status:ERROR, message}
+        fullchain, privkey = mat.get("fullchain", ""), mat.get("privkey", "")
+        err = self._validate_cert_pair(fullchain, privkey)
+        if err:
+            return err
+        cp = self.control_plane
+        agent_id = data.get("agent_id")
+        if agent_id:
+            if not getattr(cp, "connected_agents", {}).get(agent_id):
+                return {"status": "ERROR",
+                        "message": f"Agent '{agent_id}' not connected"}
+        else:
+            if not getattr(cp, "connected_agents", {}):
+                return {"status": "ERROR",
+                        "message": "no le agent connected — start one and retry"}
+            agent_id = next(iter(cp.connected_agents))
+        res = await self._deploy_cert_to_agent(agent_id, fullchain, privkey, domain)
+        # Record the agent as a ledger target so auto-deploy-on-connect is
+        # idempotent + the UI reflects the push (mirrors LE_MARK_DISTRIBUTED).
+        hostname = await self._agent_hostname(agent_id)
+        t = Ledger.add_target(self._certs, domain, "agent", hostname)
+        if t is not None:
+            t["last_pushed_hash"] = mat.get("material_hash")
+            t["last_pushed_at"] = _now_iso()
+            t["last_status"] = res.get("status")
+            t["last_message"] = res.get("message")
+            self._persist()
+        return {"status": res.get("status", "ERROR"),
+                "data": {"domain": domain, "agent_id": agent_id,
+                         "hostname": hostname,
+                         "message": res.get("message", "")}}

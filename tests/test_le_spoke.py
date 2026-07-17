@@ -367,3 +367,196 @@ def test_renew_failure_does_not_emit_event(tmp_path, monkeypatch):
     _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
     _cmd(spoke, "LE_RENEW_CERT", {"domain": "example.com"})
     assert [e for e in cp.events if e["type"] == "LE_CERT_RENEWED"] == []
+
+
+# ── Agent-host cert deploy (dumb Agent on a cert-target box) ────────────────────
+# The spoke validates the cert+key pair in-process (ssl.load_cert_chain) before
+# any material reaches a live host, then drives the Agent with WRITE_FILE +
+# RUN_COMMAND. A real self-signed cert+key is generated with cryptography so the
+# in-process validation passes for the success path (fake PEM bodies are
+# rejected by the SSL library, exactly like netbox's install-cert tests).
+
+import datetime as _dt  # noqa: E402
+
+
+def _real_pair(cn="example.com"):
+    """Real self-signed cert + matching privkey (PEM) so ssl.load_cert_chain
+    accepts the pair during the spoke's in-process validation step."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = _dt.datetime.utcnow()
+    cert = (x509.CertificateBuilder().subject_name(subj).issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - _dt.timedelta(days=1))
+            .not_valid_after(now + _dt.timedelta(days=365))
+            .sign(key, hashes.SHA256()))
+    crt_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    key_pem = key.private_bytes(serialization.Encoding.PEM,
+                                serialization.PrivateFormat.TraditionalOpenSSL,
+                                serialization.NoEncryption()).decode()
+    return crt_pem, key_pem
+
+
+class _FakeAgentCP:
+    """Stand-in for LEControlPlane: holds connected_agents (so the spoke can
+    resolve hostnames + target a specific Agent) and records send_to_agent calls
+    (WRITE_FILE / RUN_COMMAND) with configurable RUN_COMMAND results. Mirrors the
+    AgentHostingControlPlane.send_to_agent surface the deploy path uses."""
+
+    def __init__(self, agent_id="le-agent-1", hostname="web-1",
+                 helper_rc=0, helper_stdout="OK installed example.com",
+                 helper_stderr=""):
+        self.connected_agents = {agent_id: {"ws": object(), "hostname": hostname}}
+        self.calls = []
+        self._agent_id = agent_id
+        self._helper_rc = helper_rc
+        self._helper_stdout = helper_stdout
+        self._helper_stderr = helper_stderr
+
+    async def send_to_agent(self, cmd_type, data, agent_id=None, timeout=15.0):
+        self.calls.append({"cmd": cmd_type, "data": data,
+                           "agent_id": agent_id, "timeout": timeout})
+        if cmd_type == "WRITE_FILE":
+            return {"status": "SUCCESS"}
+        if cmd_type == "RUN_COMMAND":
+            cmd = (data or {}).get("command", "")
+            if "rm -f" in cmd:  # cleanup — result ignored by the spoke
+                return {"status": "SUCCESS", "result": {"rc": 0, "stdout": "",
+                                                        "stderr": ""}}
+            # The install-helper invocation.
+            return {"status": "SUCCESS", "result": {
+                "rc": self._helper_rc, "stdout": self._helper_stdout,
+                "stderr": self._helper_stderr}}
+        return {"status": "SUCCESS"}
+
+
+def _spoke_with_agent_cp(tmp_path, monkeypatch, **cp_kwargs):
+    _install_acme_mocks(monkeypatch)
+    cfg = {"ledger_path": str(tmp_path / "certs.json")}
+    cp = _FakeAgentCP(**cp_kwargs)
+    return LESpoke("le-spoke-1", cfg, control_plane=cp), cp
+
+
+def _material_real(monkeypatch, domain="example.com"):
+    """Stub read_material to return a REAL cert pair so the deploy path's
+    in-process ssl validation passes."""
+    crt, key = _real_pair(domain)
+    monkeypatch.setattr(le_spoke, "read_material", lambda d: {
+        "status": "SUCCESS", "domain": d, "fullchain": crt, "privkey": key,
+        "chain": "", "material_hash": _HASH, "not_after": _NOTAFTER})
+    return crt, key
+
+
+def test_validate_cert_pair_rejects_non_pem(tmp_path, monkeypatch):
+    spoke, _ = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    r1 = spoke._validate_cert_pair("not a cert", _KEY)
+    r2 = spoke._validate_cert_pair(_PEM, "not a key")
+    assert r1["status"] == "ERROR" and "PEM" in r1["message"]
+    assert r2["status"] == "ERROR" and "PEM" in r2["message"]
+
+
+def test_validate_cert_pair_accepts_real_pair(tmp_path, monkeypatch):
+    spoke, _ = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    crt, key = _real_pair()
+    assert spoke._validate_cert_pair(crt, key) is None  # None == valid
+
+
+def test_deploy_to_agent_success_validates_writes_runs_and_records(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch,
+                                     helper_stdout="OK installed example.com")
+    _material_real(monkeypatch, "example.com")  # AFTER spoke build so it wins
+    # Issue first so a managed-cert entry exists for the ledger target.
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com"})
+    assert res["status"] == "SUCCESS", res
+    assert res["data"]["agent_id"] == "le-agent-1"
+    assert res["data"]["hostname"] == "web-1"
+    # Sequence: WRITE_FILE crt → WRITE_FILE key → RUN_COMMAND helper → RUN_COMMAND rm.
+    cmds = [c["cmd"] for c in cp.calls]
+    assert cmds[:2] == ["WRITE_FILE", "WRITE_FILE"]
+    assert cmds.count("WRITE_FILE") == 2
+    runs = [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
+    assert len(runs) == 2, runs
+    assert runs[0].startswith("sudo -n ") and "example.com" in runs[0]
+    assert "rm -f" in runs[1]  # cleanup of both temps
+    # Temps written 0600 with distinct .crt.pem/.key.pem names.
+    writes = [c["data"] for c in cp.calls if c["cmd"] == "WRITE_FILE"]
+    assert writes[0]["mode"] == 0o600 and writes[1]["mode"] == 0o600
+    assert writes[0]["path"].endswith(".crt.pem") and writes[1]["path"].endswith(".key.pem")
+    # Ledger records the agent target + the push for this host (idempotent re-push).
+    cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    agent_targets = [t for t in cert["targets"] if t.get("module_type") == "agent"]
+    assert len(agent_targets) == 1
+    assert agent_targets[0]["identifier"] == "web-1"
+    assert agent_targets[0]["last_status"] == "SUCCESS"
+
+
+def test_deploy_to_agent_no_agent_connected_errors(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    _material_real(monkeypatch, "example.com")
+    spoke.control_plane.connected_agents = {}  # no Agent connected
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com"})
+    assert res["status"] == "ERROR" and "no le agent connected" in res["message"]
+
+
+def test_deploy_to_agent_helper_failure_records_error_status(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, helper_rc=1,
+                                     helper_stdout="", helper_stderr="nginx -t failed")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com"})
+    assert res["status"] == "ERROR"
+    cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    agent_targets = [t for t in cert["targets"] if t.get("module_type") == "agent"]
+    assert len(agent_targets) == 1 and agent_targets[0]["last_status"] == "ERROR"
+
+
+def test_deploy_to_agent_requires_domain(tmp_path, monkeypatch):
+    spoke, _ = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {})
+    assert res["status"] == "ERROR" and "domain" in res["message"]
+
+
+def test_deploy_cached_cert_to_agent_matches_hostname_and_deploys(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, hostname="web-1")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    # Add an agent target scoped to web-1.
+    _cmd(spoke, "LE_ADD_TARGET", {"domain": "example.com",
+                                  "target": {"module_type": "agent",
+                                             "identifier": "web-1"}})
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    runs = [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
+    assert any(c.startswith("sudo -n ") for c in runs)  # helper fired
+    cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    t = [x for x in cert["targets"] if x.get("module_type") == "agent"][0]
+    assert t["last_status"] == "SUCCESS"
+
+
+def test_deploy_cached_cert_to_agent_skips_non_matching_hostname(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, hostname="web-1")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    _cmd(spoke, "LE_ADD_TARGET", {"domain": "example.com",
+                                  "target": {"module_type": "agent",
+                                             "identifier": "other-host"}})
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    # No RUN_COMMAND helper call — target is for a different host.
+    assert not [c for c in cp.calls if c["cmd"] == "RUN_COMMAND"
+                and "sudo -n" in c["data"].get("command", "")]
+
+
+def test_deploy_cached_cert_to_agent_noop_without_connected_agent(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    spoke.control_plane.connected_agents = {}  # agent gone mid-flight
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))  # must not raise
+    assert cp.calls == []

@@ -21,12 +21,16 @@ import os
 from typing import Dict, Any
 
 # Two-tier import shim (deploy-order safe). In production the lm core is on
-# PYTHONPATH (/opt/lm/core/src) so `core.src.messaging.control_plane` resolves;
-# the bare `messaging.control_plane` fallback covers running from inside src/.
+# PYTHONPATH (/opt/lm/core/src) so `core.src.messaging.agent_hosting` resolves;
+# the bare `messaging.agent_hosting` fallback covers running from inside src/.
+# AgentHostingControlPlane extends BaseControlPlane with an opt-in /ws/agent
+# listener so a dumb device-mode Agent on a cert-target box can dial THIS spoke
+# (never the hub); the spoke holds the cert-install logic and drives the Agent
+# with WRITE_FILE + RUN_COMMAND. Mirrors netbox/src/control_plane.py.
 try:
-    from core.src.messaging.control_plane import BaseControlPlane
+    from core.src.messaging.agent_hosting import AgentHostingControlPlane
 except ImportError:
-    from messaging.control_plane import BaseControlPlane
+    from messaging.agent_hosting import AgentHostingControlPlane
 
 try:
     from le_spoke import LESpoke
@@ -60,13 +64,34 @@ configure_logging()
 logger = logging.getLogger("LEControlPlane")
 
 
-class LEControlPlane(BaseControlPlane):
+class LEControlPlane(AgentHostingControlPlane):
     """Control plane for the Certificate Management (le) module.
 
-    Inherits core connectivity/auth/routing from BaseControlPlane and registers
-    a LESpoke under the module key "le". Advertises module_type "certificates"
-    so the hub routes it into the Certificate Management nav + /api/le/* routes.
+    Inherits core connectivity/auth/routing from BaseControlPlane (via
+    AgentHostingControlPlane) and registers a LESpoke under the module key
+    "le". Advertises module_type "certificates" so the hub routes it into the
+    Certificate Management nav + /api/le/* routes.
+
+    Also an **agent host** (like the pxmx + netbox spokes): when opted in, it
+    serves a ``/ws/agent`` listener so a dumb device-mode Agent on a cert-target
+    box dials THIS spoke (never the hub). The spoke holds the cert-install logic
+    and drives the Agent with WRITE_FILE + RUN_COMMAND — the same cert-custodian
+    model netbox uses. See LESpoke.deploy_cert_to_agent + _on_agent_registered.
     """
+
+    # le-unique agent-host knobs (must NOT collide with pxmx's 8443/8766 or
+    # netbox's 8444/8767 on a co-located box). Opt-in: the listener only runs
+    # when LM_LE_AGENT_LISTENER=1, so existing cert-only le spokes (which broker
+    # certs to target spokes via the hub) are byte-identical to today.
+    MODULE_TYPE = "certificates"
+    AGENT_PORT_ENV = "LM_LE_AGENT_PORT"
+    AGENT_LOOPBACK_ENV = "LM_LE_AGENT_LOOPBACK"
+    AGENT_LISTENER_ENV = "LM_LE_AGENT_LISTENER"
+    AGENT_CONFIG_PATH = "/etc/lm-le-agent/config.json"
+    AGENT_LISTENER_OPT_IN = True
+    AGENT_LOOPBACK_PORT = 8445
+    AGENT_WSS_PORT = 8445
+    AGENT_FALLBACK_PORT = 8768
 
     def get_service_name(self) -> str:
         return "lm-le"
@@ -78,15 +103,40 @@ class LEControlPlane(BaseControlPlane):
         self.config = config or {}
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "certificates"
+        self._le_spoke = None  # set in run_hub_mode(); used by _on_agent_registered
 
     async def run_hub_mode(self):
-        """Native LM spoke behavior: register the le spoke and run the loop."""
+        """Native LM spoke behavior: register the le spoke and run the loop.
+
+        Also starts the ``/ws/agent`` listener when opted in so a cert-target
+        Agent can dial this spoke; the spoke then drives cert installs via
+        WRITE_FILE + RUN_COMMAND. Gated by AGENT_LISTENER_OPT_IN + the env, so a
+        cert-only le spoke (no listener) is identical to today."""
         logger.info(f"Starting Certificate Management (le) module -> {self.hub_url}")
         # Pass self so LESpoke can emit unsolicited LE_CERT_RENEWED events to the
-        # hub via send_to_hub (event-driven distribution instead of hourly poll).
+        # hub via send_to_hub (event-driven distribution instead of hourly poll),
+        # and so deploy_cert_to_agent can reach connected_agents + send_to_agent.
         le_spoke = LESpoke(self.spoke_id, self.config, control_plane=self)
+        self._le_spoke = le_spoke
         self.register_module("le", le_spoke)
+        # Agent host: serve /ws/agent so a cert-target Agent dials us (Style 1
+        # remote wss / Style 2 loopback). Gated by AGENT_LISTENER_OPT_IN + the env.
+        if self._agent_listener_enabled():
+            self._start_agent_server_task()
+            logger.info("le agent listener started (spoke hosts cert-target Agents).")
         await self.run()
+
+    async def _on_agent_registered(self, agent_id: str):
+        """New-device-connect trigger: when a cert-target Agent connects+approves,
+        auto-deploy any cached cert whose ledger target matches that agent's host
+        (cert-custodian model, mirroring netbox). Best-effort — never break the
+        registration; an operator can always re-fire LE_DEPLOY_TO_AGENT explicitly."""
+        if self._le_spoke is not None:
+            try:
+                await self._le_spoke.deploy_cached_cert_to_agent(agent_id)
+            except Exception as e:  # noqa: BLE001 - never break registration
+                logger.debug("cert auto-deploy on agent %s connect skipped: %s",
+                             agent_id, e)
 
 
 if __name__ == "__main__":

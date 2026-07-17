@@ -1,0 +1,46 @@
+#!/bin/bash
+# Lab Manager — le cert-install helper (runs ON the cert-target Agent box).
+#
+# Invoked by the le spoke over RUN_COMMAND as:
+#   sudo -n /usr/local/bin/lm-le-install-cert <domain> <crt-tmp> <key-tmp>
+#
+# Places the cert under /etc/lm-le/certs/<domain>/ and reloads the configured
+# service. Prints `OK <msg>` on success (the spoke greps for the `OK` prefix) /
+# exits nonzero with a stderr message on failure. Mirrors the
+# lm-netbox-install-cert contract.
+#
+# Provision this on a cert-target box (NOT the le spoke):
+#   sudo install -m 0755 scripts/lm-le-install-cert /usr/local/bin/lm-le-install-cert
+# and grant the Agent's run user least-privilege NOPASSWD (only if the Agent
+# doesn't already run as root):
+#   echo "lm-agent ALL=(ALL) NOPASSWD: /usr/local/bin/lm-le-install-cert" \
+#       | sudo tee /etc/sudoers.d/lm-le-install-cert
+set -euo pipefail
+
+DOMAIN="${1:-}"
+CRT="${2:-}"
+KEY="${3:-}"
+
+if [ -z "$DOMAIN" ] || [ -z "$CRT" ] || [ -z "$KEY" ]; then
+    echo "usage: lm-le-install-cert <domain> <crt-tmp> <key-tmp>" >&2
+    exit 2
+fi
+[ -r "$CRT" ] || { echo "crt file not readable: $CRT" >&2; exit 2; }
+[ -r "$KEY" ] || { echo "key file not readable: $KEY" >&2; exit 2; }
+
+DEST="/etc/lm-le/certs/$DOMAIN"
+mkdir -p "$DEST"
+chmod 700 "$DEST"
+
+install -m 0644 "$CRT" "$DEST/fullchain.pem"
+install -m 0600 "$KEY" "$DEST/privkey.pem"
+
+# Reload the service that terminates TLS for this target. Default: nginx. Override
+# per-box via LM_LE_INSTALL_RELOAD_CMD (e.g. "systemctl reload haproxy"). A failing
+# reload is logged but NOT fatal — the cert is on disk; the operator can reload.
+RELOAD_CMD="${LM_LE_INSTALL_RELOAD_CMD:-systemctl reload nginx || systemctl restart nginx || true}"
+if ! eval "$RELOAD_CMD" >/dev/null 2>&1; then
+    echo "OK installed $DOMAIN (reload skipped — check LM_LE_INSTALL_RELOAD_CMD)"
+else
+    echo "OK installed $DOMAIN"
+fi
