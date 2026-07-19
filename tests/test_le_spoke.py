@@ -175,8 +175,55 @@ def test_issue_failure_returns_error(tmp_path, monkeypatch):
     spoke = LESpoke("le-spoke-1", cfg)  # no loop → renewal deferred (ok)
     res = _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com"})
     assert res["status"] == "ERROR"
-    # Nothing recorded on failure.
-    assert _cmd(spoke, "LE_LIST_CERTS")["data"]["count"] == 0
+    # A failed issue now PERSISTS in the ledger (last_issue_error set) so the
+    # hub's le_cache / Certificates list / cert-issue-failed alert can see it.
+    lst = _cmd(spoke, "LE_LIST_CERTS")["data"]
+    assert lst["count"] == 1
+    entry = lst["certs"][0]
+    assert entry["domain"] == "example.com"
+    assert entry["last_issue_error"]  # the failure marker
+    assert entry["material_hash"] is None  # no cert material issued
+    assert entry["not_after"] is None
+
+
+def test_issue_success_clears_issue_error(tmp_path, monkeypatch):
+    """A successful issue after a prior failure clears last_issue_error (the
+    cert-issue-failed alert edge recovers)."""
+    _install_acme_mocks(monkeypatch, issue_status="ERROR")
+    cfg = {"ledger_path": str(tmp_path / "certs.json")}
+    spoke = LESpoke("le-spoke-1", cfg)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com"})  # fails → recorded
+    entry = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert entry["last_issue_error"]
+    # Now succeed (re-issue the same domain): merge, keep no material, clear error.
+    _install_acme_mocks(monkeypatch, issue_status="SUCCESS")
+    res = _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com"})
+    assert res["status"] == "SUCCESS"
+    entry = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert entry["last_issue_error"] is None
+    assert entry["material_hash"] == _HASH  # success stamped material
+
+
+def test_issue_failure_reissue_preserves_existing_cert(tmp_path, monkeypatch):
+    """A failed RE-issue of an already-issued domain MERGES — it preserves the
+    existing cert's material_hash/not_after/targets (still valid) and only
+    stamps the failure, rather than wiping the good cert."""
+    _install_acme_mocks(monkeypatch, issue_status="SUCCESS")
+    cfg = {"ledger_path": str(tmp_path / "certs.json")}
+    spoke = LESpoke("le-spoke-1", cfg)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "a.com"})
+    _cmd(spoke, "LE_ADD_TARGET", {"domain": "a.com", "target": {"module_type": "firewall"}})
+    before = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert before["material_hash"] == _HASH
+    assert before["targets"]
+    # Re-issue fails: existing cert material + targets MUST survive.
+    _install_acme_mocks(monkeypatch, issue_status="ERROR")
+    res = _cmd(spoke, "LE_ISSUE_CERT", {"domain": "a.com"})
+    assert res["status"] == "ERROR"
+    after = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert after["material_hash"] == _HASH  # preserved, not wiped
+    assert after["targets"]  # preserved
+    assert after["last_issue_error"]  # failure stamped
 
 
 # ── renew / revoke ───────────────────────────────────────────────────────────
@@ -366,7 +413,29 @@ def test_renew_failure_does_not_emit_event(tmp_path, monkeypatch):
     spoke = LESpoke("le-spoke-1", cfg, control_plane=cp)
     _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
     _cmd(spoke, "LE_RENEW_CERT", {"domain": "example.com"})
+    # A renew failure does NOT emit LE_CERT_RENEWED (success-only)...
     assert [e for e in cp.events if e["type"] == "LE_CERT_RENEWED"] == []
+    # ...but it DOES emit LE_CERT_RENEW_FAILED so the hub can fire a realtime
+    # cert-renewal-failed alert (vs. waiting for the hourly LE_LIST_CERTS pull).
+    failed = [e for e in cp.events if e["type"] == "LE_CERT_RENEW_FAILED"
+              and e["data"]["domain"] == "example.com"]
+    assert len(failed) == 1
+    assert failed[0]["data"]["message"]  # the failure detail
+
+
+def test_notify_renew_failed_emits_event(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_cp(tmp_path, monkeypatch)
+    _run(spoke._notify_renew_failed("example.com", "certbot renew rc=1"))
+    assert len(cp.events) == 1
+    assert cp.events[0]["type"] == "LE_CERT_RENEW_FAILED"
+    assert cp.events[0]["data"]["domain"] == "example.com"
+    assert cp.events[0]["data"]["message"] == "certbot renew rc=1"
+
+
+def test_notify_renew_failed_noop_without_control_plane(tmp_path, monkeypatch):
+    spoke = _spoke(tmp_path, monkeypatch)
+    assert spoke.control_plane is None
+    _run(spoke._notify_renew_failed("example.com", "x"))  # no error, no send
 
 
 # ── Agent-host cert deploy (dumb Agent on a cert-target box) ────────────────────

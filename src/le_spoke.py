@@ -176,6 +176,9 @@ class LESpoke(BaseSpoke):
                     logger.error("renew failed for %s: %s", domain,
                                  res.get("message"))
                     changed = True
+                    # Event-driven alert: tell the hub now so a renewal failure
+                    # surfaces as a realtime cert alert (vs. the hourly pull).
+                    await self._notify_renew_failed(domain, res.get("message"))
         if changed:
             self.ledger.save(self._certs)
 
@@ -183,6 +186,40 @@ class LESpoke(BaseSpoke):
 
     def _persist(self):
         self.ledger.save(self._certs)
+
+    def _record_issue(self, domain: str, tenant_id: str, success: bool,
+                      message: str, challenge: str, email: str,
+                      staging: bool) -> None:
+        """Record an issue attempt's outcome in the ledger so a FAILED issue
+        persists — visible via LE_LIST_CERTS → the hub's le_cache → the
+        Certificates list + Certificates log, and scannable by the hub's
+        cert-issue-failed alert. A failed issue of a NEW domain creates a
+        minimal entry (no cert material); a failed RE-issue of an existing
+        domain MERGES (preserves material_hash/not_after/targets — the
+        previously-issued cert is still valid) and just stamps the failure.
+        ``last_issue_error`` (None on success) is the alert/UI marker; cleared
+        on a successful issue so the alert edge recovers."""
+        certs = self._certs.setdefault("certs", {})
+        entry = certs.get(domain)
+        if entry is None:
+            entry = {"domain": domain, "email": email, "challenge": challenge,
+                     "dns_provider": None, "dns_credential": None,
+                     "tenant_id": tenant_id or "default", "staging": bool(staging),
+                     "not_after": None, "material_hash": None,
+                     "renew_window_days": None, "targets": [],
+                     "last_renewed_at": None, "last_error": None}
+            certs[domain] = entry
+        # Refresh the operator-supplied issue params so a retry is pre-filled.
+        if email:
+            entry["email"] = email
+        if challenge:
+            entry["challenge"] = challenge
+        if tenant_id:
+            entry["tenant_id"] = tenant_id
+        entry["staging"] = bool(staging)
+        entry["last_issue_at"] = _now_iso()
+        entry["last_issue_error"] = None if success else (message or "issue failed")
+        self._persist()
 
     def _public_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """Ledger entry minus nothing sensitive (targets carry only push state).
@@ -214,6 +251,22 @@ class LESpoke(BaseSpoke):
             })
         except Exception as e:  # noqa: BLE001
             logger.warning("LE_CERT_RENEWED notify for %s failed: %s", domain, e)
+
+    async def _notify_renew_failed(self, domain: str, message: str) -> None:
+        """Emit LE_CERT_RENEW_FAILED to the hub so a background (or on-demand)
+        renewal failure can drive a realtime cert-renewal-failed alert instead
+        of waiting for the hourly LE_LIST_CERTS pull. Best-effort, same shape as
+        _notify_renewed; the ledger's ``last_error`` is the persisted record
+        either way (the event is the prompt transport)."""
+        if not self.control_plane:
+            return
+        try:
+            await self.control_plane.send_to_hub("LE_CERT_RENEW_FAILED", {
+                "domain": domain,
+                "message": message or "renew failed",
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LE_CERT_RENEW_FAILED notify for %s failed: %s", domain, e)
 
     # ── BaseSpoke contract ────────────────────────────────────────────────────
 
@@ -412,8 +465,14 @@ class LESpoke(BaseSpoke):
             try:
                 mat = dns_credentials.materialize(tenant_id, cred_name)
             except KeyError as e:
+                self._record_issue(domain, tenant_id, False, str(e), challenge, email,
+                                   bool(data.get("staging", False)))
+                logger.error("issue failed for %s: %s", domain, e)
                 return {"status": "ERROR", "message": str(e)}
             except Exception as e:  # noqa: BLE001
+                self._record_issue(domain, tenant_id, False, f"DNS credential error: {e}",
+                                  challenge, email, bool(data.get("staging", False)))
+                logger.error("issue failed for %s: DNS credential error: %s", domain, e)
                 return {"status": "ERROR", "message": f"DNS credential error: {e}"}
         try:
             res = await acme_issue(
@@ -431,8 +490,14 @@ class LESpoke(BaseSpoke):
                 key_type=data.get("key_type", "rsa"),
             )
         except ValueError as e:
+            self._record_issue(domain, tenant_id, False, str(e), challenge, email,
+                               bool(data.get("staging", False)))
+            logger.error("issue failed for %s: %s", domain, e)
             return {"status": "ERROR", "message": str(e)}
         if res.get("status") != "SUCCESS":
+            self._record_issue(domain, tenant_id, False, res.get("message"),
+                               challenge, email, bool(data.get("staging", False)))
+            logger.error("issue failed for %s: %s", domain, res.get("message"))
             return res
         mat = read_material(domain)
         # Per-cert renewal window (days before expiry the loop triggers). Default
@@ -460,6 +525,8 @@ class LESpoke(BaseSpoke):
             "targets": [],
             "last_renewed_at": None,
             "last_error": None,
+            "last_issue_at": _now_iso(),
+            "last_issue_error": None,
         }
         Ledger.upsert_cert(self._certs, entry)
         # Seed targets from the issue request AFTER upsert (upsert replaces the
@@ -506,6 +573,9 @@ class LESpoke(BaseSpoke):
                 renewed.append({"domain": d, "renewed": False,
                                 "error": res.get("message"),
                                 "targets": entry.get("targets", [])})
+                # Event-driven alert for on-demand renewal failure too (mirrors
+                # the background loop's _notify_renew_failed).
+                await self._notify_renew_failed(d, res.get("message"))
         self._persist()
         return {"status": "SUCCESS", "data": {"renewed": renewed,
                                                "count": len(renewed)}}
