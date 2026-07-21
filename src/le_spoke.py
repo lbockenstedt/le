@@ -149,15 +149,35 @@ class LESpoke(BaseSpoke):
             # renewed out-of-band, or the ledger is stale post-restart). Only mark
             # changed on an ACTUAL diff so we don't rewrite the ledger every tick.
             mat = read_material(domain)
-            if mat.get("status") == "SUCCESS" and (
-                    entry.get("material_hash") != mat.get("material_hash")
-                    or entry.get("not_after") != mat.get("not_after")):
-                entry["material_hash"] = mat.get("material_hash")
-                entry["not_after"] = mat.get("not_after")
-                changed = True
+            if mat.get("status") == "SUCCESS":
+                if (entry.get("material_hash") != mat.get("material_hash")
+                        or entry.get("not_after") != mat.get("not_after")):
+                    entry["material_hash"] = mat.get("material_hash")
+                    entry["not_after"] = mat.get("not_after")
+                    changed = True
+            else:
+                # A transient read failure (perms, mid-renew race, disk) must
+                # not silently skip this cert's renew evaluation — surface it so
+                # a stuck cert is visible, then fall through to expiring() using
+                # the ledger's last-known not_after.
+                logger.warning("reconcile: read_material(%s) failed (%s); "
+                               "evaluating renewal from ledger state",
+                               domain, mat.get("message", "unknown"))
             if expiring(entry):
                 logger.info("renewing %s (expiring)", domain)
-                res = await acme_renew(domain)
+                # No overall deadline on acme_renew means one domain stuck on
+                # DNS propagation (or a certbot hang) would freeze renewals for
+                # EVERY other domain. Bound it so a stuck domain can't starve
+                # the rest; on timeout, log + continue to the next domain.
+                try:
+                    res = await asyncio.wait_for(acme_renew(domain), timeout=600)
+                except asyncio.TimeoutError:
+                    logger.error("renew for %s timed out after 600s; "
+                                 "continuing with remaining domains", domain)
+                    entry["last_error"] = "renew timed out after 600s"
+                    changed = True
+                    await self._notify_renew_failed(domain, "renew timed out after 600s")
+                    continue
                 if domain not in certs:
                     continue  # a handler removed this cert during the renew await
                 if res.get("status") == "SUCCESS":
@@ -511,6 +531,16 @@ class LESpoke(BaseSpoke):
                 rwd = None
         except (TypeError, ValueError):
             rwd = None
+        # Re-add (re-issue of an existing domain): capture its current
+        # distribution targets BEFORE the upsert replaces the whole entry.
+        # Dropping them would silently unlink a live cert from its push
+        # destinations; carrying them forward with RESET push markers (below)
+        # guarantees a config-changing re-add re-fires distribution with the
+        # freshly-issued material instead of leaving a stale last_pushed_hash
+        # that makes the hub skip the re-push.
+        prev = self._certs.get("certs", {}).get(domain) or {}
+        prev_targets = [t for t in (prev.get("targets") or [])
+                        if isinstance(t, dict) and t.get("module_type")]
         entry: Dict[str, Any] = {
             "domain": domain,
             "email": email,
@@ -529,12 +559,21 @@ class LESpoke(BaseSpoke):
             "last_issue_error": None,
         }
         Ledger.upsert_cert(self._certs, entry)
-        # Seed targets from the issue request AFTER upsert (upsert replaces the
-        # whole entry, so adding first would be wiped). Idempotent.
-        for t in (data.get("targets") or []):
+        # Seed targets AFTER upsert (upsert replaces the whole entry, so adding
+        # first would be wiped): carried-forward targets first, then any from
+        # the issue request. add_target is idempotent on (module_type,
+        # identifier) and creates each target with last_pushed_hash=None, so
+        # every target re-enters an un-pushed state → distribution re-fires.
+        for t in prev_targets + list(data.get("targets") or []):
             if isinstance(t, dict) and t.get("module_type"):
                 Ledger.add_target(self._certs, domain, t["module_type"],
                                   t.get("identifier", "") or "")
+        # Belt-and-suspenders: force the un-pushed state on ALL targets so a
+        # re-add always re-distributes fresh material regardless of add_target's
+        # defaults.
+        for t in self._certs.get("certs", {}).get(domain, {}).get("targets", []):
+            t["last_pushed_hash"] = None
+            t["last_pushed_at"] = None
         self._persist()
         saved = self._certs["certs"][domain]
         return {"status": "SUCCESS", "data": {
