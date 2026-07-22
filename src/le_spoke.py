@@ -253,6 +253,7 @@ class LESpoke(BaseSpoke):
         e.setdefault("renew_window_days", None)
         e["renew_window_days_effective"] = (e["renew_window_days"]
                                             if e["renew_window_days"] else _RENEW_WINDOW_DAYS)
+        e.setdefault("client_auth", False)   # clientAuth EKU requested (mTLS client use)
         return e
 
     async def _notify_renewed(self, domain: str, entry: Dict[str, Any]) -> None:
@@ -340,6 +341,9 @@ class LESpoke(BaseSpoke):
 
         if cmd == "LE_ISSUE_CERT":
             return await self._issue(data)
+
+        if cmd == "LE_SET_CLIENTAUTH":
+            return await self._set_clientauth(data)
 
         if cmd == "LE_RENEW_CERT":
             return await self._renew(data)
@@ -469,6 +473,34 @@ class LESpoke(BaseSpoke):
 
     # ── command implementations ───────────────────────────────────────────────
 
+    async def _set_clientauth(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Toggle the clientAuth EKU on an EXISTING managed cert and re-issue now so
+        the new ACME profile takes effect. Rebuilds the issue request from the cert's
+        stored ledger params (challenge, email, DNS credential, tenant, staging) +
+        the new flag, force-renewing. For mTLS CLIENT certs (BugFixer, the wildcard);
+        certs that don't need it stay on the default server-only profile."""
+        domain = data.get("domain")
+        if not domain:
+            return {"status": "ERROR", "message": "LE_SET_CLIENTAUTH requires 'domain'"}
+        entry = self._certs.get("certs", {}).get(domain)
+        if not entry:
+            return {"status": "ERROR", "message": f"no managed cert for {domain}"}
+        enabled = bool(data.get("client_auth", data.get("enabled", False)))
+        issue_data = {
+            "domain": domain,
+            "email": entry.get("email") or "",
+            "challenge": entry.get("challenge") or "http",
+            "dns_provider": entry.get("dns_provider"),
+            "dns_credential": entry.get("dns_credential"),
+            "tenant_id": entry.get("tenant_id") or "default",
+            "staging": bool(entry.get("staging", False)),
+            "key_type": entry.get("key_type", "rsa"),
+            "renew_window_days": entry.get("renew_window_days"),
+            "client_auth": enabled,
+            "force_renewal": True,
+        }
+        return await self._issue(issue_data)
+
     async def _issue(self, data: Dict[str, Any]) -> Dict[str, Any]:
         domain = data.get("domain")
         if not domain:
@@ -508,6 +540,11 @@ class LESpoke(BaseSpoke):
                 route53_env=mat.get("route53_env"),
                 staging=bool(data.get("staging", False)),
                 key_type=data.get("key_type", "rsa"),
+                # clientAuth EKU (for mTLS CLIENT certs, e.g. BugFixer): request the
+                # ACME "classic"-style profile. force_renewal lets a toggle on an
+                # EXISTING cert take effect now instead of waiting for expiry.
+                client_auth=bool(data.get("client_auth", False)),
+                force_renewal=bool(data.get("force_renewal", False)),
             )
         except ValueError as e:
             self._record_issue(domain, tenant_id, False, str(e), challenge, email,
@@ -549,6 +586,7 @@ class LESpoke(BaseSpoke):
             "dns_credential": cred_name,
             "tenant_id": tenant_id,
             "staging": bool(data.get("staging", False)),
+            "client_auth": bool(data.get("client_auth", False)),
             "not_after": mat.get("not_after") if mat.get("status") == "SUCCESS" else None,
             "material_hash": mat.get("material_hash") if mat.get("status") == "SUCCESS" else None,
             "renew_window_days": rwd,

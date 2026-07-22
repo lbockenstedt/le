@@ -206,11 +206,19 @@ def _normalize_challenge(challenge: str) -> str:
         f"unsupported challenge '{challenge}' (expected http/dns/tls-alpn)")
 
 
+# ACME profile (Let's Encrypt "certificate profiles") requested when a cert needs
+# the clientAuth EKU for mTLS CLIENT use. LE's default "tlsserver" profile is
+# serverAuth-ONLY; "classic" carries serverAuth + clientAuth. Overridable per-CA
+# via env for ACME servers that name the both-EKU profile differently.
+CLIENTAUTH_PROFILE = os.getenv("LM_LE_CLIENTAUTH_PROFILE", "classic")
+
+
 def issue_argv(domain: str, email: str, challenge: str, *,
                webroot: Optional[str] = None, dns_provider: Optional[str] = None,
                dns_creds_ini: Optional[str] = None, staging: bool = False,
                key_type: str = "rsa", cert_name: Optional[str] = None,
                propagation_seconds: int = _PROPAGATION_DEFAULT,
+               client_auth: bool = False, force_renewal: bool = False,
                bin_path: str = CERTBOT_BIN) -> List[str]:
     """Build the ``certbot certonly`` argv for one domain.
 
@@ -220,11 +228,21 @@ def issue_argv(domain: str, email: str, challenge: str, *,
     authenticator for this challenge by default; it requires a TLS-ALPN-01
     plugin installed on the host. If none is present, certbot itself fails
     with a clear "no authenticator" message, surfaced verbatim by ``issue()``.
+
+    ``client_auth`` requests the ACME profile that includes the clientAuth EKU
+    (``--preferred-profile``) so the cert can be presented as an mTLS CLIENT cert
+    (e.g. the BugFixer cert). certbot persists the profile into the renewal config,
+    so renewals keep it. ``force_renewal`` re-issues even if not near expiry — used
+    when toggling clientAuth on an existing cert so the new profile takes effect now.
     """
     ch = _normalize_challenge(challenge)
     argv: List[str] = [bin_path, "certonly", "--non-interactive",
                        "--agree-tos", "--no-eff-email"]
     argv += ["-d", domain, "--cert-name", cert_name or domain]
+    if client_auth:
+        argv += ["--preferred-profile", CLIENTAUTH_PROFILE]
+    if force_renewal:
+        argv += ["--force-renewal"]
     if email:
         argv += ["-m", email]
     if key_type:
@@ -310,6 +328,7 @@ async def issue(domain: str, email: str, challenge: str, *,
                 staging: bool = False, key_type: str = "rsa",
                 cert_name: Optional[str] = None,
                 propagation_seconds: int = _PROPAGATION_DEFAULT,
+                client_auth: bool = False, force_renewal: bool = False,
                 bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
     """Issue a cert. Returns {status, ...} with the live dir on success.
 
@@ -346,7 +365,9 @@ async def issue(domain: str, email: str, challenge: str, *,
     argv = issue_argv(domain, email, challenge, webroot=webroot,
                       dns_provider=dns_provider, dns_creds_ini=ini,
                       staging=staging, key_type=key_type, cert_name=cert_name,
-                      propagation_seconds=propagation_seconds, bin_path=bin_path)
+                      propagation_seconds=propagation_seconds,
+                      client_auth=client_auth, force_renewal=force_renewal,
+                      bin_path=bin_path)
     # route53 has no --dns-route53-credentials file; certbot-dns-route53 reads
     # AWS creds from the environment, passed through per-issue (never logged).
     rc, out, err = await _run(argv, env=route53_env or None)
