@@ -267,6 +267,7 @@ class LESpoke(BaseSpoke):
         e["renew_window_days_effective"] = (e["renew_window_days"]
                                             if e["renew_window_days"] else _RENEW_WINDOW_DAYS)
         e.setdefault("client_auth", False)   # clientAuth EKU requested (mTLS client use)
+        e.setdefault("profile", None)        # ACME profile (validity/EKU) — None = CA default
         return e
 
     async def _notify_renewed(self, domain: str, entry: Dict[str, Any]) -> None:
@@ -558,9 +559,11 @@ class LESpoke(BaseSpoke):
                 staging=bool(data.get("staging", False)),
                 key_type=data.get("key_type", "rsa"),
                 # clientAuth EKU (for mTLS CLIENT certs, e.g. BugFixer): request the
-                # ACME "classic"-style profile. force_renewal lets a toggle on an
+                # ACME "classic"-style profile. An explicit ``profile`` (e.g. a
+                # short-lived one) overrides. force_renewal lets a toggle on an
                 # EXISTING cert take effect now instead of waiting for expiry.
                 client_auth=bool(data.get("client_auth", False)),
+                profile=(data.get("profile") or None),
                 force_renewal=bool(data.get("force_renewal", False)),
             )
         except ValueError as e:
@@ -604,6 +607,7 @@ class LESpoke(BaseSpoke):
             "tenant_id": tenant_id,
             "staging": bool(data.get("staging", False)),
             "client_auth": bool(data.get("client_auth", False)),
+            "profile": (data.get("profile") or None),
             "not_after": mat.get("not_after") if mat.get("status") == "SUCCESS" else None,
             "material_hash": mat.get("material_hash") if mat.get("status") == "SUCCESS" else None,
             "renew_window_days": rwd,
@@ -640,12 +644,15 @@ class LESpoke(BaseSpoke):
 
     async def _renew(self, data: Dict[str, Any]) -> Dict[str, Any]:
         domain = data.get("domain")
+        # Per-cert "Renew now" forces re-issue regardless of expiry; "Renew all"
+        # (no domain) stays soft so it only renews certs actually due.
+        force = bool(data.get("force", False))
         renewed: List[Dict[str, Any]] = []
         domains = [domain] if domain else list(self._certs.get("certs", {}).keys())
         if domain and domain not in self._certs.get("certs", {}):
             return {"status": "ERROR", "message": f"No managed cert for {domain}"}
         for d in domains:
-            res = await acme_renew(d)
+            res = await acme_renew(d, force=force)
             entry = self._certs.get("certs", {}).get(d)
             if entry is None:
                 continue

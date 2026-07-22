@@ -253,10 +253,15 @@ def _normalize_challenge(challenge: str) -> str:
         f"unsupported challenge '{challenge}' (expected http/dns/tls-alpn)")
 
 
-# ACME profile (Let's Encrypt "certificate profiles") requested when a cert needs
-# the clientAuth EKU for mTLS CLIENT use. LE's default "tlsserver" profile is
-# serverAuth-ONLY; "classic" carries serverAuth + clientAuth. Overridable per-CA
-# via env for ACME servers that name the both-EKU profile differently.
+# ACME profile (Let's Encrypt "certificate profiles"). LE bundles the EKU set AND
+# the validity period into a named profile — the client can't request an arbitrary
+# lifetime, only pick a profile:
+#   classic     — ~90d, serverAuth + clientAuth (needed for mTLS CLIENT certs)
+#   tlsserver   — ~90d, serverAuth only
+#   shortlived  — ~7d,  serverAuth only (LE short-lived certs)
+# The exact names/validities are advertised by the CA (see acme_info → profiles).
+# CLIENTAUTH_PROFILE is the both-EKU profile requested by the clientAuth toggle;
+# an explicit ``profile`` (e.g. a short-lived one) overrides it. Both env-tunable.
 CLIENTAUTH_PROFILE = os.getenv("LM_LE_CLIENTAUTH_PROFILE", "classic")
 
 
@@ -265,7 +270,8 @@ def issue_argv(domain: str, email: str, challenge: str, *,
                dns_creds_ini: Optional[str] = None, staging: bool = False,
                key_type: str = "rsa", cert_name: Optional[str] = None,
                propagation_seconds: int = _PROPAGATION_DEFAULT,
-               client_auth: bool = False, force_renewal: bool = False,
+               client_auth: bool = False, profile: Optional[str] = None,
+               force_renewal: bool = False,
                bin_path: str = CERTBOT_BIN) -> List[str]:
     """Build the ``certbot certonly`` argv for one domain.
 
@@ -286,8 +292,11 @@ def issue_argv(domain: str, email: str, challenge: str, *,
     argv: List[str] = [bin_path, "certonly", "--non-interactive",
                        "--agree-tos", "--no-eff-email"]
     argv += ["-d", domain, "--cert-name", cert_name or domain]
-    if client_auth:
-        argv += ["--preferred-profile", CLIENTAUTH_PROFILE]
+    # ACME profile: an explicit ``profile`` (e.g. a short-lived one) wins; else the
+    # clientAuth toggle maps to the both-EKU profile. None → the CA's default (~90d).
+    prof = (profile or "").strip() or (CLIENTAUTH_PROFILE if client_auth else "")
+    if prof:
+        argv += ["--preferred-profile", prof]
     if force_renewal:
         argv += ["--force-renewal"]
     if email:
@@ -324,9 +333,15 @@ def issue_argv(domain: str, email: str, challenge: str, *,
     return argv
 
 
-def renew_argv(domain: str, *, bin_path: str = CERTBOT_BIN) -> List[str]:
-    return [bin_path, "renew", "--cert-name", domain, "--non-interactive",
+def renew_argv(domain: str, *, force: bool = False,
+               bin_path: str = CERTBOT_BIN) -> List[str]:
+    argv = [bin_path, "renew", "--cert-name", domain, "--non-interactive",
             "--no-random-sleep-on-renew"]
+    if force:
+        # certbot renew is a no-op unless within 30d of expiry; --force-renewal
+        # re-issues NOW regardless (the per-cert "Renew now" button).
+        argv.append("--force-renewal")
+    return argv
 
 
 def revoke_argv(domain: str, *, delete: bool = True,
@@ -375,7 +390,8 @@ async def issue(domain: str, email: str, challenge: str, *,
                 staging: bool = False, key_type: str = "rsa",
                 cert_name: Optional[str] = None,
                 propagation_seconds: int = _PROPAGATION_DEFAULT,
-                client_auth: bool = False, force_renewal: bool = False,
+                client_auth: bool = False, profile: Optional[str] = None,
+                force_renewal: bool = False,
                 bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
     """Issue a cert. Returns {status, ...} with the live dir on success.
 
@@ -413,8 +429,8 @@ async def issue(domain: str, email: str, challenge: str, *,
                       dns_provider=dns_provider, dns_creds_ini=ini,
                       staging=staging, key_type=key_type, cert_name=cert_name,
                       propagation_seconds=propagation_seconds,
-                      client_auth=client_auth, force_renewal=force_renewal,
-                      bin_path=bin_path)
+                      client_auth=client_auth, profile=profile,
+                      force_renewal=force_renewal, bin_path=bin_path)
     # route53 has no --dns-route53-credentials file; certbot-dns-route53 reads
     # AWS creds from the environment, passed through per-issue (never logged).
     rc, out, err = await _run(argv, env=route53_env or None)
@@ -425,13 +441,15 @@ async def issue(domain: str, email: str, challenge: str, *,
             "live_dir": os.path.join(LE_LIVE_DIR, cert_name or domain)}
 
 
-async def renew(domain: str, *, bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
+async def renew(domain: str, *, force: bool = False,
+                bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
     """Renew one cert via ``certbot renew --cert-name <domain>``. Returns
     ``{status, domain, renewed, live_dir}``; ``renewed`` is False when certbot
-    reports the cert isn't due yet (rc 0, no-op)."""
+    reports the cert isn't due yet (rc 0, no-op). ``force`` adds --force-renewal
+    to re-issue NOW regardless of expiry (the per-cert 'Renew now' button)."""
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
-    rc, out, err = await _run(renew_argv(domain, bin_path=bin_path))
+    rc, out, err = await _run(renew_argv(domain, force=force, bin_path=bin_path))
     if not _ok(rc):
         # renew prints "No renewals were attempted." (rc 0) when nothing's due;
         # a non-zero here is a real failure.
