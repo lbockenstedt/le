@@ -48,6 +48,41 @@ def present(bin_path: str = CERTBOT_BIN) -> bool:
     return bool(shutil.which(bin_path))
 
 
+async def acme_info(bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
+    """certbot version + whether it supports ACME profiles (--preferred-profile,
+    added in certbot 4.0) + the ACME directory's advertised profiles (real LE prod
+    by default). Answers 'I requested clientAuth but got serverAuth-only': shows
+    whether certbot is new enough and what the clientAuth-capable profile is
+    actually NAMED on this CA (so LM_LE_CLIENTAUTH_PROFILE can be set correctly)."""
+    info: Dict[str, Any] = {"clientauth_profile": CLIENTAUTH_PROFILE}
+    try:
+        _rc, out, err = await _run([bin_path, "--version"], timeout=20)
+        info["certbot_version"] = (out or err).strip()
+    except Exception as e:  # noqa: BLE001
+        info["certbot_version"] = f"error: {e}"
+    try:
+        _rc, out, _err = await _run([bin_path, "--help", "all"], timeout=30)
+        info["supports_profiles"] = "--preferred-profile" in (out or "")
+    except Exception:  # noqa: BLE001
+        info["supports_profiles"] = None
+    directory = os.getenv("LM_LE_ACME_DIRECTORY",
+                          "https://acme-v02.api.letsencrypt.org/directory")
+    info["acme_directory"] = directory
+
+    def _fetch_profiles():
+        import urllib.request
+        import json as _json
+        with urllib.request.urlopen(directory, timeout=10) as r:  # noqa: S310
+            d = _json.loads(r.read().decode())
+        return (d.get("meta") or {}).get("profiles") or {}
+    try:
+        info["profiles"] = await asyncio.to_thread(_fetch_profiles)
+    except Exception as e:  # noqa: BLE001
+        info["profiles"] = {}
+        info["profiles_error"] = str(e)[:200]
+    return info
+
+
 # certbot DNS-01 plugins → Debian apt package. cloudflare + route53 are
 # apt-preinstalled by install_le.sh; the rest are apt-installed ON DEMAND by
 # ensure_dns_plugin() when a DNS-01 issue targets them. The system certbot

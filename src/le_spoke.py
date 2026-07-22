@@ -345,6 +345,10 @@ class LESpoke(BaseSpoke):
         if cmd == "LE_SET_CLIENTAUTH":
             return await self._set_clientauth(data)
 
+        if cmd == "LE_ACME_INFO":
+            from acme import acme_info as _acme_info  # type: ignore[import-not-found]
+            return {"status": "SUCCESS", "data": await _acme_info()}
+
         if cmd == "LE_RENEW_CERT":
             return await self._renew(data)
 
