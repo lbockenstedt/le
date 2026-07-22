@@ -122,10 +122,23 @@ class LESpoke(BaseSpoke):
     async def _renew_loop(self):
         """Daily: reconcile ledger with /etc/letsencrypt/live and renew any cert
         within the 30-day window. On a successful renew, refresh material_hash +
-        not_after so the hub's distribution loop re-pushes the new material."""
-        # No blocking prime — reconciliation happens on the first tick.
+        not_after so the hub's distribution loop re-pushes the new material. Also
+        ensures certbot is profile-capable + keeps it auto-updated (certbot_update)."""
+        # One-time: make certbot ACME-profile-capable (installs a recent certbot in
+        # a venv if the system one is too old for --preferred-profile). Best-effort.
+        try:
+            import certbot_update  # type: ignore[import-not-found]
+            await certbot_update.ensure_certbot()
+        except Exception as e:  # noqa: BLE001 - never let this break renewals
+            logger.warning("certbot ensure/update skipped: %s", e)
         while True:
             try:
+                # Keep certbot current each cycle (venv pip -U / snap / apt).
+                try:
+                    import certbot_update  # type: ignore[import-not-found]
+                    await certbot_update.refresh()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("certbot refresh skipped: %s", e)
                 await self._reconcile_and_renew()
             except asyncio.CancelledError:
                 break

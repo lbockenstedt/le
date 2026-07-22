@@ -129,6 +129,18 @@ async def ensure_dns_plugin(provider: str) -> Dict[str, Any]:
     The le spoke runs as root, so apt-get is available.
     """
     prov = (provider or "").strip().lower()
+    # If a profile-capable certbot was installed into a venv (certbot_update), the
+    # active certbot loads plugins from THAT venv, not apt — install there instead.
+    try:
+        import certbot_update  # type: ignore[import-not-found]
+        if certbot_update.venv_certbot():
+            if await certbot_update.ensure_venv_plugin(prov):
+                return {"status": "SUCCESS",
+                        "message": f"dns plugin {prov} installed in the certbot venv"}
+            return {"status": "ERROR",
+                    "message": f"no certbot-dns plugin mapped/installable for '{prov}' in the venv"}
+    except Exception:  # noqa: BLE001 - fall back to the apt path below
+        pass
     if dns_plugin_present(prov):
         return {"status": "SUCCESS", "message": f"dns plugin {prov} already installed"}
     pkg = _DNS_PLUGIN_APT.get(prov)
