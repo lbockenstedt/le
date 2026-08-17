@@ -105,11 +105,24 @@ def _record_ids(session, zone_id, name, value):
     })
     html = r.text or ""
     ids = []
-    # Each editable row carries data-Name / data-Content and its recordid.
-    for m in re.finditer(r'hosted_dns_recordid="(\d+)"[^>]*data-name="([^"]*)"[^>]*data-content="([^"]*)"', html, re.I):
-        rid, rname, rcontent = m.group(1), m.group(2).strip().lower(), m.group(3).strip('"')
-        if rname == name.lower() and (not value or value in rcontent):
-            ids.append(rid)
+    # Each editable row carries data-Name / data-Content and its recordid on a
+    # single element. HE's attribute ORDER is not stable (the old single-regex
+    # form required recordid→data-name→data-content in that exact order and so
+    # silently matched ZERO rows whenever HE reordered them — leaving stale
+    # _acme-challenge TXT records behind on cleanup). Match each element that
+    # carries a recordid, then pull its attributes order-independently.
+    name_l = name.lower()
+    for tag in re.finditer(r'<[^>]*\bhosted_dns_recordid="\d+"[^>]*>', html, re.I):
+        seg = tag.group(0)
+        rid_m = re.search(r'hosted_dns_recordid="(\d+)"', seg)
+        nm_m = re.search(r'data-name="([^"]*)"', seg, re.I)
+        if not rid_m or not nm_m:
+            continue
+        ct_m = re.search(r'data-content="([^"]*)"', seg, re.I)
+        rname = nm_m.group(1).strip().lower()
+        rcontent = ct_m.group(1).strip('"') if ct_m else ""
+        if rname == name_l and (not value or value in rcontent):
+            ids.append(rid_m.group(1))
     return ids
 
 
