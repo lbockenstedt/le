@@ -220,6 +220,41 @@ class LESpoke(BaseSpoke):
     def _persist(self):
         self.ledger.save(self._certs)
 
+    def _write_he_from_payload(self, creds: Dict[str, Any]) -> bool:
+        """(Re)write he-login.ini from a resolved HE account-login payload.
+        Returns True on write. The secret is never logged or stored in ledger/
+        config — only the 0600 hook file certbot's he_dns.py reads."""
+        if not isinstance(creds, dict):
+            return False
+        u = (creds.get("he_username") or "").strip()
+        p = creds.get("he_password") or ""
+        if not (u and p):
+            return False
+        try:
+            write_he_creds(u, p)
+            return True
+        except Exception as e:  # noqa: BLE001 — never break renew on a write hiccup
+            logger.warning("write he-login.ini from vault sync failed: %s", e)
+            return False
+
+    def _apply_renew_vault_creds(self, domain: str, data: Dict[str, Any]) -> None:
+        """Before renewing ``domain``, apply any per-domain vault DNS creds the
+        hub injected into the renew request (``vault_dns_creds`` map)."""
+        vmap = data.get("vault_dns_creds")
+        if not isinstance(vmap, dict):
+            return
+        vc = vmap.get(domain)
+        if isinstance(vc, dict):
+            self._write_he_from_payload(vc)
+
+    def _sync_vault_dns(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle LE_SYNC_VAULT_DNS: (re)write DNS-01 hook creds the hub resolved
+        from the Credential Vault. Currently supports HE account-login
+        (``he_username``/``he_password``), the durable source for HE DNS-01
+        renewals across spoke reinstalls. Idempotent + best-effort."""
+        wrote_he = self._write_he_from_payload(data or {})
+        return {"status": "SUCCESS", "data": {"wrote_he_login": wrote_he}}
+
     def _record_issue(self, domain: str, tenant_id: str, success: bool,
                       message: str, challenge: str, email: str,
                       staging: bool) -> None:
@@ -268,6 +303,7 @@ class LESpoke(BaseSpoke):
                                             if e["renew_window_days"] else _RENEW_WINDOW_DAYS)
         e.setdefault("client_auth", False)   # clientAuth EKU requested (mTLS client use)
         e.setdefault("profile", None)        # ACME profile (validity/EKU) — None = CA default
+        e.setdefault("dns_vault_credential", None)  # {bucket,name} vault ref (no secret) for UI round-trip
         return e
 
     async def _notify_renewed(self, domain: str, entry: Dict[str, Any]) -> None:
@@ -365,6 +401,15 @@ class LESpoke(BaseSpoke):
 
         if cmd == "LE_RENEW_CERT":
             return await self._renew(data)
+
+        if cmd == "LE_SYNC_VAULT_DNS":
+            # Hub push of freshly vault-resolved DNS-01 creds (e.g. on spoke
+            # (re)connect) so certbot's he_dns hook has he-login.ini even after a
+            # spoke reinstall wiped it. The SECRET lives only in the Credential
+            # Vault; the hub resolves it and pushes it here to (re)write the
+            # 0600 hook file. Not persisted in spoke state — only the on-disk
+            # he-login.ini (which a reinstall wipes and this restores).
+            return self._sync_vault_dns(data)
 
         if cmd == "LE_REVOKE_CERT":
             return await self._revoke(data)
@@ -510,6 +555,7 @@ class LESpoke(BaseSpoke):
             "challenge": entry.get("challenge") or "http",
             "dns_provider": entry.get("dns_provider"),
             "dns_credential": entry.get("dns_credential"),
+            "dns_vault_credential": entry.get("dns_vault_credential"),
             "tenant_id": entry.get("tenant_id") or "default",
             "staging": bool(entry.get("staging", False)),
             "key_type": entry.get("key_type", "rsa"),
@@ -604,6 +650,12 @@ class LESpoke(BaseSpoke):
             "challenge": challenge,
             "dns_provider": data.get("dns_provider") or mat.get("dns_provider"),
             "dns_credential": cred_name,
+            # Vault DNS-01 credential reference ({bucket,name}) the hub resolved
+            # for this issue. Stored so the UI round-trips the selection on edit
+            # and so a renew/re-issue keeps using the same vault secret. The
+            # SECRET itself is never stored here — only the reference; the hub
+            # re-resolves it from the Credential Vault at issue/renew/reconnect.
+            "dns_vault_credential": data.get("dns_vault_credential"),
             "tenant_id": tenant_id,
             "staging": bool(data.get("staging", False)),
             "client_auth": bool(data.get("client_auth", False)),
@@ -652,6 +704,11 @@ class LESpoke(BaseSpoke):
         if domain and domain not in self._certs.get("certs", {}):
             return {"status": "ERROR", "message": f"No managed cert for {domain}"}
         for d in domains:
+            # Durable renew: if the hub pushed freshly-vault-resolved DNS creds
+            # for this domain, (re)write he-login.ini BEFORE certbot re-runs the
+            # he_dns hook — so a renew succeeds even if the spoke's local
+            # he-login.ini was lost (e.g. after a spoke reinstall).
+            self._apply_renew_vault_creds(d, data)
             res = await acme_renew(d, force=force)
             entry = self._certs.get("certs", {}).get(d)
             if entry is None:

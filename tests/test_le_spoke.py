@@ -629,3 +629,52 @@ def test_deploy_cached_cert_to_agent_noop_without_connected_agent(tmp_path, monk
     spoke.control_plane.connected_agents = {}  # agent gone mid-flight
     _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))  # must not raise
     assert cp.calls == []
+
+# ── durable vault DNS-01 creds (LE_SYNC_VAULT_DNS + round-trip) ───────────────
+
+def test_sync_vault_dns_writes_he_login(tmp_path, monkeypatch):
+    spoke = _spoke(tmp_path, monkeypatch)
+    seen = {}
+    monkeypatch.setattr(le_spoke, "write_he_creds",
+                        lambda u, p: seen.update(u=u, p=p))
+    res = _cmd(spoke, "LE_SYNC_VAULT_DNS",
+               {"he_username": "acct@e.com", "he_password": "s3cret"})
+    assert res["status"] == "SUCCESS"
+    assert res["data"]["wrote_he_login"] is True
+    assert seen == {"u": "acct@e.com", "p": "s3cret"}
+
+
+def test_sync_vault_dns_ignores_empty_creds(tmp_path, monkeypatch):
+    spoke = _spoke(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(le_spoke, "write_he_creds",
+                        lambda u, p: calls.append((u, p)))
+    res = _cmd(spoke, "LE_SYNC_VAULT_DNS", {"he_username": "", "he_password": ""})
+    assert res["status"] == "SUCCESS"
+    assert res["data"]["wrote_he_login"] is False
+    assert calls == []
+
+
+def test_issue_round_trips_vault_credential(tmp_path, monkeypatch):
+    spoke = _spoke(tmp_path, monkeypatch)
+    ref = {"bucket": "__admin__", "name": "he"}
+    res = _cmd(spoke, "LE_ISSUE_CERT",
+               {"domain": "example.com", "challenge": "dns",
+                "dns_vault_credential": ref})
+    assert res["status"] == "SUCCESS"
+    cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
+    assert cert["dns_vault_credential"] == ref
+
+
+def test_renew_applies_hub_pushed_vault_creds(tmp_path, monkeypatch):
+    spoke = _spoke(tmp_path, monkeypatch)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "dns"})
+    seen = {}
+    monkeypatch.setattr(le_spoke, "write_he_creds",
+                        lambda u, p: seen.update(u=u, p=p))
+    res = _cmd(spoke, "LE_RENEW_CERT",
+               {"domain": "example.com", "force": True,
+                "vault_dns_creds": {"example.com":
+                                    {"he_username": "u@e", "he_password": "pw"}}})
+    assert res["status"] == "SUCCESS"
+    assert seen == {"u": "u@e", "p": "pw"}
