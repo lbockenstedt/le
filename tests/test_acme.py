@@ -64,6 +64,25 @@ def test_issue_dns_requires_provider():
     assert False, "dns challenge without provider should raise"
 
 
+def test_acme_issue_dns_empty_provider_clear_error(monkeypatch):
+    """A DNS-01 issue with no resolved provider (e.g. a dropped vault/named
+    credential reference from a stale hub) must fail with an actionable message
+    BEFORE the cryptic ensure_dns_plugin('') path."""
+    import asyncio
+    monkeypatch.setattr(acme, "present", lambda *a, **k: True)
+    # Guard runs before ensure_dns_plugin — if it were reached, fail loudly.
+    async def _boom(_p):
+        raise AssertionError("ensure_dns_plugin should not be called on empty provider")
+    monkeypatch.setattr(acme, "ensure_dns_plugin", _boom)
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            acme.issue("example.com", "a@b.com", "dns", dns_provider=""))
+    except ValueError as e:
+        assert "did not resolve" in str(e)
+        return
+    assert False, "empty dns provider should raise ValueError"
+
+
 def test_issue_staging_flag():
     argv = acme.issue_argv("example.com", "a@b.com", "http", staging=True)
     assert "--staging" in argv
