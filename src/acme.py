@@ -405,6 +405,18 @@ async def issue(domain: str, email: str, challenge: str, *,
         return {"status": "ERROR", "message": "certbot not installed"}
     ini = dns_creds_ini
     if _normalize_challenge(challenge) == "dns":
+        # A DNS-01 issue needs a resolved provider. Empty/None here means the
+        # request reached us without one — typically a dropped credential
+        # reference (e.g. a hub that relayed a `dns_vault_credential` /
+        # `dns_credential` it was too old to resolve, or a stale hub process that
+        # didn't reload after an update). Fail with an actionable message instead
+        # of the cryptic "no apt package mapped for dns provider ''".
+        if not (dns_provider or "").strip():
+            raise ValueError(
+                "DNS-01 issue has no DNS provider/credential — the credential "
+                "reference did not resolve. Pick a DNS credential (or the "
+                "Credential Vault entry) when issuing, and if you just updated "
+                "the hub, restart it so the new resolver loads.")
         if dns_provider == HE_LOGIN_PROVIDER:
             # Account-login HE uses the built-in manual authenticator + he_dns.py
             # hook (no DNS plugin to install). Persist any per-request creds so the
