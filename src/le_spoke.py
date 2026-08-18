@@ -16,6 +16,7 @@ masked at the command boundary; ``LE_GET_CERT`` returns it for transport only.
 import asyncio
 import logging
 import os
+import re
 import ssl
 import tempfile
 import time
@@ -64,6 +65,7 @@ _RENEW_BACKOFF = 60
 # / exits nonzero with stderr on failure. Override for non-default paths.
 _LE_INSTALL_CERT_HELPER = os.getenv("LM_LE_INSTALL_CERT_HELPER",
                                     "/usr/local/bin/lm-le-install-cert")
+_LE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
 
 def _read_version() -> str:
@@ -816,6 +818,10 @@ class LESpoke(BaseSpoke):
         cp = self.control_plane
         if cp is None or not hasattr(cp, "send_to_agent"):
             return {"status": "ERROR", "message": "spoke is not an agent host"}
+        if not isinstance(domain, str) or not _LE_DOMAIN_RE.fullmatch(domain):
+            return {"status": "ERROR",
+                    "message": "invalid domain: expected letters, digits, dots, and hyphens only"}
+
         ts = str(int(time.time() * 1000))
         crt_tmp = f"/tmp/lm-le-{ts}.crt.pem"
         key_tmp = f"/tmp/lm-le-{ts}.key.pem"
@@ -826,9 +832,9 @@ class LESpoke(BaseSpoke):
             await cp.send_to_agent("WRITE_FILE",
                                    {"path": key_tmp, "content": privkey,
                                     "mode": 0o600}, agent_id=agent_id, timeout=20.0)
-            cmd = f"sudo -n {_LE_INSTALL_CERT_HELPER} {domain} {crt_tmp} {key_tmp}"
+            cmd = ["sudo", "-n", _LE_INSTALL_CERT_HELPER, domain, crt_tmp, key_tmp]
             res = await cp.send_to_agent("RUN_COMMAND",
-                                         {"command": cmd, "allow_shell": True,
+                                         {"command": cmd, "allow_shell": False,
                                           "timeout": 30}, agent_id=agent_id,
                                         timeout=40.0)
         except Exception as e:  # noqa: BLE001
@@ -836,8 +842,8 @@ class LESpoke(BaseSpoke):
         finally:
             try:
                 await cp.send_to_agent("RUN_COMMAND",
-                                       {"command": f"rm -f {crt_tmp} {key_tmp}",
-                                        "allow_shell": True, "timeout": 10},
+                                       {"command": ["rm", "-f", crt_tmp, key_tmp],
+                                        "allow_shell": False, "timeout": 10},
                                        agent_id=agent_id, timeout=15.0)
             except Exception:  # noqa: BLE001 - cleanup best-effort
                 pass
