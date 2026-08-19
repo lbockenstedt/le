@@ -2,7 +2,7 @@
 
 Debian/Ubuntu apt certbot tops out at 2.x–3.x — too old for ACME certificate
 PROFILES (``--preferred-profile``, certbot >= 4.0), which LM needs to request the
-clientAuth EKU for mTLS CLIENT certs (BugFixer, the mTLS wildcard). When the system
+clientAuth EKU for mTLS CLIENT certs (AppBuilder, the mTLS wildcard). When the system
 certbot is too old this installs a recent certbot into a self-contained pip venv
 (LXC-friendly, vs snap which is flaky in unprivileged containers) WITH the DNS-01
 plugins, and symlinks it ahead of the apt one on PATH (``/usr/local/bin`` precedes

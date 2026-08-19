@@ -542,7 +542,7 @@ class LESpoke(BaseSpoke):
         """Toggle the clientAuth EKU on an EXISTING managed cert and re-issue now so
         the new ACME profile takes effect. Rebuilds the issue request from the cert's
         stored ledger params (challenge, email, DNS credential, tenant, staging) +
-        the new flag, force-renewing. For mTLS CLIENT certs (BugFixer, the wildcard);
+        the new flag, force-renewing. For mTLS CLIENT certs (AppBuilder, the wildcard);
         certs that don't need it stay on the default server-only profile."""
         domain = data.get("domain")
         if not domain:
@@ -606,7 +606,7 @@ class LESpoke(BaseSpoke):
                 route53_env=mat.get("route53_env"),
                 staging=bool(data.get("staging", False)),
                 key_type=data.get("key_type", "rsa"),
-                # clientAuth EKU (for mTLS CLIENT certs, e.g. BugFixer): request the
+                # clientAuth EKU (for mTLS CLIENT certs, e.g. AppBuilder): request the
                 # ACME "classic"-style profile. An explicit ``profile`` (e.g. a
                 # short-lived one) overrides. force_renewal lets a toggle on an
                 # EXISTING cert take effect now instead of waiting for expiry.

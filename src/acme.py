@@ -284,7 +284,7 @@ def issue_argv(domain: str, email: str, challenge: str, *,
 
     ``client_auth`` requests the ACME profile that includes the clientAuth EKU
     (``--preferred-profile``) so the cert can be presented as an mTLS CLIENT cert
-    (e.g. the BugFixer cert). certbot persists the profile into the renewal config,
+    (e.g. the AppBuilder cert). certbot persists the profile into the renewal config,
     so renewals keep it. ``force_renewal`` re-issues even if not near expiry — used
     when toggling clientAuth on an existing cert so the new profile takes effect now.
     """
