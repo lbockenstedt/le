@@ -21,6 +21,8 @@ import os
 import re
 import sys
 import time
+import html as _htmllib
+from html.parser import HTMLParser
 
 import requests
 
@@ -98,31 +100,101 @@ def _add_txt(session, zone_id, name, value):
     })
 
 
+class _RecordRowParser(HTMLParser):
+    """Parse HE's edit-zone record table into ``{id, name, type, content}`` rows.
+
+    HE renders each record as a ``<tr class="dns_tr...">`` whose ``<td>`` cells
+    are, in order: 0 zone-id, 1 record-id, 2 name, 3 type (a
+    ``<span class="rrlabel" data="TXT">``), 4 ttl, 5 priority, 6 value (the full
+    value is in the cell's ``data`` attr; the visible text may be truncated),
+    7 is-dynamic. This mirrors the henet module's proven ``henet_scrape``
+    parser — the previous cleanup regex looked for ``hosted_dns_recordid`` /
+    ``data-name`` / ``data-content`` attributes that HE's record TABLE never
+    emits (those are edit-FORM field names), so it matched ZERO rows and left
+    every ``_acme-challenge`` TXT behind on cleanup.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self._in_row = False
+        self._in_td = False
+        self._cells = []
+        self._cur_data = None
+        self._text = []
+        self._rtype = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "tr":
+            if "dns_tr" in a.get("class", ""):
+                self._in_row = True
+                self._cells = []
+                self._rtype = None
+            return
+        if not self._in_row:
+            return
+        if tag == "td":
+            self._in_td = True
+            self._cur_data = a.get("data")
+            self._text = []
+        elif tag == "span" and "rrlabel" in a.get("class", ""):
+            self._rtype = (a.get("data") or a.get("alt") or "").strip() or self._rtype
+
+    def handle_data(self, data):
+        if self._in_td:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "td" and self._in_row:
+            self._cells.append({"data": self._cur_data, "text": "".join(self._text).strip()})
+            self._in_td = False
+            self._cur_data = None
+            self._text = []
+        elif tag == "tr" and self._in_row:
+            self._finish_row()
+            self._in_row = False
+
+    def _finish_row(self):
+        cells = self._cells
+        if len(cells) < 7:
+            return
+        rid = _htmllib.unescape(cells[1]["text"]).strip()
+        name = _htmllib.unescape(cells[2]["text"]).strip().rstrip(".")
+        rtype = (self._rtype or _htmllib.unescape(cells[3]["text"])).strip().upper()
+        vcell = cells[6]
+        content = _htmllib.unescape((vcell.get("data") or vcell.get("text") or "")).strip()
+        if rid and name:
+            self.rows.append({"id": rid, "name": name, "type": rtype, "content": content})
+
+
 def _record_ids(session, zone_id, name, value):
-    """recordids of the TXT rows matching name (+ value if present)."""
+    """recordids of the ``_acme-challenge`` TXT rows matching ``name`` (+ ``value``
+    if given). Parses HE's real record table (see :class:`_RecordRowParser`)."""
     r = session.get(HE_URL, headers=_UA, timeout=30, params={
         "hosted_dns_zoneid": zone_id, "menu": "edit_zone", "hosted_dns_editzone": "1",
     })
     html = r.text or ""
+    parser = _RecordRowParser()
+    try:
+        parser.feed(html)
+    except Exception:  # noqa: BLE001 — best-effort parse of a live third-party page
+        pass
+    name_l = name.strip().rstrip(".").lower()
+    # HE HTML-encodes the TXT value's surrounding quotes; strip them both sides
+    # so a bare token matches a "quoted" stored value.
+    want = (value or "").strip().strip('"')
     ids = []
-    # Each editable row carries data-Name / data-Content and its recordid on a
-    # single element. HE's attribute ORDER is not stable (the old single-regex
-    # form required recordid→data-name→data-content in that exact order and so
-    # silently matched ZERO rows whenever HE reordered them — leaving stale
-    # _acme-challenge TXT records behind on cleanup). Match each element that
-    # carries a recordid, then pull its attributes order-independently.
-    name_l = name.lower()
-    for tag in re.finditer(r'<[^>]*\bhosted_dns_recordid="\d+"[^>]*>', html, re.I):
-        seg = tag.group(0)
-        rid_m = re.search(r'hosted_dns_recordid="(\d+)"', seg)
-        nm_m = re.search(r'data-name="([^"]*)"', seg, re.I)
-        if not rid_m or not nm_m:
+    for row in parser.rows:
+        # Only TXT rows are challenge records; tolerate a blank/unknown type
+        # (match by name) rather than skip, but never delete a non-TXT record.
+        if row["type"] and row["type"] != "TXT":
             continue
-        ct_m = re.search(r'data-content="([^"]*)"', seg, re.I)
-        rname = nm_m.group(1).strip().lower()
-        rcontent = ct_m.group(1).strip('"') if ct_m else ""
-        if rname == name_l and (not value or value in rcontent):
-            ids.append(rid_m.group(1))
+        if row["name"].lower() != name_l:
+            continue
+        content = row["content"].strip().strip('"')
+        if not want or want in content:
+            ids.append(row["id"])
     return ids
 
 

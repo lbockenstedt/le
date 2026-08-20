@@ -38,37 +38,55 @@ class _FakeSession:
         return _Resp("")
 
 
-# ── _record_ids: order-independent parsing (the Issue-2 regression) ───────────
+# ── _record_ids: parses HE's real record table ───────────────────────────────
+# HE renders each record as <tr class="dns_tr..."> with <td> cells in order:
+# 0 zone-id, 1 record-id, 2 name, 3 type (rrlabel span data=), 4 ttl,
+# 5 priority, 6 value (data= attr), 7 is-dynamic — the same structure the
+# henet module's import scraper parses. (The old cleanup regex looked for
+# data-name/data-content/hosted_dns_recordid ATTRIBUTES that this table never
+# emits, so it matched zero rows and never deleted the stale TXT.)
 
-def test_record_ids_matches_regardless_of_attribute_order():
-    # One row in canonical order, one with the attributes shuffled — the old
-    # ordered regex would only have matched the first.
-    html = (
-        '<tr hosted_dns_recordid="123" data-name="_acme-challenge.example.com"'
-        ' data-content="tok-A">'
-        '<tr data-content="tok-B" data-name="_acme-challenge.example.com"'
-        ' hosted_dns_recordid="456">'
+def _row(rid, name, rtype, content, ttl="300"):
+    return (
+        '<tr class="dns_tr">'
+        '<td>zoneid</td>'
+        f'<td>{rid}</td>'
+        f'<td>{name}</td>'
+        f'<td><span class="rrlabel" data="{rtype}">{rtype}</span></td>'
+        f'<td>{ttl}</td>'
+        '<td>-</td>'
+        f'<td data="{content}">{content}</td>'
+        '<td>0</td>'
+        '</tr>'
     )
+
+
+def test_record_ids_matches_all_rows_for_the_name():
+    html = (_row("123", "_acme-challenge.example.com", "TXT", "tok-A")
+            + _row("456", "_acme-challenge.example.com", "TXT", "tok-B"))
     ids = he_dns._record_ids(_FakeSession(html), "z1",
                              "_acme-challenge.example.com", None)
     assert set(ids) == {"123", "456"}
 
 
 def test_record_ids_filters_by_value_when_given():
-    html = (
-        '<tr hosted_dns_recordid="123" data-name="_acme-challenge.example.com"'
-        ' data-content="tok-A">'
-        '<tr hosted_dns_recordid="456" data-name="_acme-challenge.example.com"'
-        ' data-content="tok-B">'
-    )
+    html = (_row("123", "_acme-challenge.example.com", "TXT", "tok-A")
+            + _row("456", "_acme-challenge.example.com", "TXT", "tok-B"))
     ids = he_dns._record_ids(_FakeSession(html), "z1",
                              "_acme-challenge.example.com", "tok-A")
     assert ids == ["123"]
 
 
 def test_record_ids_ignores_other_record_names():
-    html = ('<tr hosted_dns_recordid="9" data-name="www.example.com"'
-            ' data-content="x">')
+    html = _row("9", "www.example.com", "A", "1.2.3.4")
+    ids = he_dns._record_ids(_FakeSession(html), "z1",
+                             "_acme-challenge.example.com", None)
+    assert ids == []
+
+
+def test_record_ids_never_deletes_non_txt_records():
+    # A same-named A record must never be matched for challenge cleanup.
+    html = _row("5", "_acme-challenge.example.com", "A", "1.2.3.4")
     ids = he_dns._record_ids(_FakeSession(html), "z1",
                              "_acme-challenge.example.com", None)
     assert ids == []
@@ -77,8 +95,7 @@ def test_record_ids_ignores_other_record_names():
 def test_record_ids_strips_quotes_in_content_match():
     # HE HTML-encodes the TXT content's surrounding quotes (&quot;); the
     # substring value match must still succeed against the encoded form.
-    html = ('<tr hosted_dns_recordid="7" data-name="_acme-challenge.example.com"'
-            ' data-content="&quot;tok-A&quot;">')
+    html = _row("7", "_acme-challenge.example.com", "TXT", "&quot;tok-A&quot;")
     ids = he_dns._record_ids(_FakeSession(html), "z1",
                              "_acme-challenge.example.com", "tok-A")
     assert ids == ["7"]
@@ -87,8 +104,7 @@ def test_record_ids_strips_quotes_in_content_match():
 # ── _run cleanup end-to-end: stale TXT is actually deleted ────────────────────
 
 def test_run_cleanup_deletes_matching_txt(monkeypatch):
-    zone_edit = ('<tr hosted_dns_recordid="77"'
-                 ' data-name="_acme-challenge.example.com" data-content="V">')
+    zone_edit = _row("77", "_acme-challenge.example.com", "TXT", "V")
     sess = _FakeSession(zone_edit)
     monkeypatch.setattr(he_dns.requests, "Session", lambda: sess)
     monkeypatch.setattr(he_dns, "_login", lambda s, u, p: "home")
