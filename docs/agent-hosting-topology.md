@@ -1,3 +1,8 @@
+---
+summary: "The tiered Hub → Spoke → Agent model is 'always-a-spoke': a dumb device-mode Agent never talks to the hub."
+keywords: [agent, agent_secret, host, hosting, le, lm_le_agent_listener, lm_le_agent_port, run_command, topology, write_file]
+---
+
 # Agent-hosting topology — which spokes serve `/ws/agent`
 
 The tiered Hub → Spoke → Agent model is "always-a-spoke": a dumb device-mode

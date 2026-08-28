@@ -1,3 +1,8 @@
+---
+summary: "Certificate producer spoke. Repo: le. moduletype = 'certificates'. See architecture-topology.md."
+keywords: [cs, dashboard, dns, global_config, install_cert, le, lm, module_type, pxmx, renew_interval]
+---
+
 # le — Certificate Management
 
 Certificate producer spoke. Repo: `le`. `module_type = "certificates"`. See [architecture-topology.md](architecture-topology.md).
