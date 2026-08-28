@@ -67,6 +67,24 @@ def _install_acme_mocks(monkeypatch, issue_status="SUCCESS",
     monkeypatch.setattr(le_spoke, "read_material", _material)
     monkeypatch.setattr(le_spoke, "certbot_present", lambda: True)
 
+    # Neutralize the RENEWAL LOOP body. UPDATE_CONFIG calls _start_renew_loop,
+    # which schedules the real _renew_loop -- and its first act is
+    # certbot_update.ensure_certbot(), which builds a venv under
+    # /opt/lm-le/certbot-venv and pip-installs certbot from the network. On a
+    # dev Mac that fails instantly (/opt not writable) so the task died before
+    # anyone noticed; on the CI runner /opt IS writable, so the test really
+    # started installing certbot and the harness's cleanup gather then waited
+    # forever on a task blocked in uncancellable work -- every CI run on this
+    # repo hung in 'Run tests' until the 6h limit.
+    #
+    # Replace the BODY, not _start_renew_loop, so the scheduling behaviour
+    # under test (a task is created / an old one replaced) still runs for real
+    # while doing no I/O.
+    async def _inert_renew_loop(self):
+        await asyncio.Event().wait()   # park until cancelled
+
+    monkeypatch.setattr(LESpoke, "_renew_loop", _inert_renew_loop)
+
 
 def _spoke(tmp_path, monkeypatch):
     _install_acme_mocks(monkeypatch)
