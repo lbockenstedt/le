@@ -1,4 +1,14 @@
 #!/bin/bash
+
+# Resolve the branch this checkout is deployed on so a dev/qa host is not
+# hard-reset back onto main by an installer re-run. Detached HEAD (or any git
+# failure) falls back to main.
+_deployed_branch() {
+  local b
+  b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  case "$b" in ""|HEAD) echo main ;; *) echo "$b" ;; esac
+}
+
 set -e
 
 # Lab Manager — Certificate Management (le) spoke installer.
@@ -145,10 +155,10 @@ fi
 
 if [ -d "le/.git" ]; then
     echo "📂 le repository already exists. Updating..."
-    cd le && git fetch origin -q && git reset --hard origin/main && cd ..   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
+    cd le && BR=$(_deployed_branch) && git fetch origin -q "$BR" && git reset --hard "origin/$BR" && cd ..   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
 else
     echo "🌐 Cloning Certificate Management (le) repository..."
-    git clone https://github.com/lbockenstedt/le.git
+    git clone --branch "${LE_BRANCH:-main}" https://github.com/lbockenstedt/le.git
 fi
 
 SPOKE_PATH="$INSTALL_DIR/le"
