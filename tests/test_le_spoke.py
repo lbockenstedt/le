@@ -552,8 +552,15 @@ def test_deploy_to_agent_success_validates_writes_runs_and_records(tmp_path, mon
     assert cmds.count("WRITE_FILE") == 2
     runs = [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
     assert len(runs) == 2, runs
-    assert runs[0].startswith("sudo -n ") and "example.com" in runs[0]
-    assert "rm -f" in runs[1]  # cleanup of both temps
+    # argv list, NOT a shell string: the deploy passes the domain and the two
+    # temp paths as separate argv entries with allow_shell False, so a domain
+    # can never be word-split or interpreted by a shell on the agent.
+    assert runs[0][:2] == ["sudo", "-n"]
+    assert "example.com" in runs[0]
+    assert runs[1][:2] == ["rm", "-f"]  # cleanup of both temps
+    assert all(isinstance(c, list) for c in runs), runs
+    assert all(c["data"]["allow_shell"] is False
+               for c in cp.calls if c["cmd"] == "RUN_COMMAND")
     # Temps written 0600 with distinct .crt.pem/.key.pem names.
     writes = [c["data"] for c in cp.calls if c["cmd"] == "WRITE_FILE"]
     assert writes[0]["mode"] == 0o600 and writes[1]["mode"] == 0o600
@@ -603,7 +610,7 @@ def test_deploy_cached_cert_to_agent_matches_hostname_and_deploys(tmp_path, monk
                                              "identifier": "web-1"}})
     _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
     runs = [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
-    assert any(c.startswith("sudo -n ") for c in runs)  # helper fired
+    assert any(c[:2] == ["sudo", "-n"] for c in runs)  # helper fired
     cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
     t = [x for x in cert["targets"] if x.get("module_type") == "agent"][0]
     assert t["last_status"] == "SUCCESS"
