@@ -67,6 +67,24 @@ def _install_acme_mocks(monkeypatch, issue_status="SUCCESS",
     monkeypatch.setattr(le_spoke, "read_material", _material)
     monkeypatch.setattr(le_spoke, "certbot_present", lambda: True)
 
+    # Neutralize the RENEWAL LOOP body. UPDATE_CONFIG calls _start_renew_loop,
+    # which schedules the real _renew_loop -- and its first act is
+    # certbot_update.ensure_certbot(), which builds a venv under
+    # /opt/lm-le/certbot-venv and pip-installs certbot from the network. On a
+    # dev Mac that fails instantly (/opt not writable) so the task died before
+    # anyone noticed; on the CI runner /opt IS writable, so the test really
+    # started installing certbot and the harness's cleanup gather then waited
+    # forever on a task blocked in uncancellable work -- every CI run on this
+    # repo hung in 'Run tests' until the 6h limit.
+    #
+    # Replace the BODY, not _start_renew_loop, so the scheduling behaviour
+    # under test (a task is created / an old one replaced) still runs for real
+    # while doing no I/O.
+    async def _inert_renew_loop(self):
+        await asyncio.Event().wait()   # park until cancelled
+
+    monkeypatch.setattr(LESpoke, "_renew_loop", _inert_renew_loop)
+
 
 def _spoke(tmp_path, monkeypatch):
     _install_acme_mocks(monkeypatch)
@@ -552,8 +570,15 @@ def test_deploy_to_agent_success_validates_writes_runs_and_records(tmp_path, mon
     assert cmds.count("WRITE_FILE") == 2
     runs = [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
     assert len(runs) == 2, runs
-    assert runs[0].startswith("sudo -n ") and "example.com" in runs[0]
-    assert "rm -f" in runs[1]  # cleanup of both temps
+    # argv list, NOT a shell string: the deploy passes the domain and the two
+    # temp paths as separate argv entries with allow_shell False, so a domain
+    # can never be word-split or interpreted by a shell on the agent.
+    assert runs[0][:2] == ["sudo", "-n"]
+    assert "example.com" in runs[0]
+    assert runs[1][:2] == ["rm", "-f"]  # cleanup of both temps
+    assert all(isinstance(c, list) for c in runs), runs
+    assert all(c["data"]["allow_shell"] is False
+               for c in cp.calls if c["cmd"] == "RUN_COMMAND")
     # Temps written 0600 with distinct .crt.pem/.key.pem names.
     writes = [c["data"] for c in cp.calls if c["cmd"] == "WRITE_FILE"]
     assert writes[0]["mode"] == 0o600 and writes[1]["mode"] == 0o600
@@ -603,7 +628,7 @@ def test_deploy_cached_cert_to_agent_matches_hostname_and_deploys(tmp_path, monk
                                              "identifier": "web-1"}})
     _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
     runs = [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
-    assert any(c.startswith("sudo -n ") for c in runs)  # helper fired
+    assert any(c[:2] == ["sudo", "-n"] for c in runs)  # helper fired
     cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
     t = [x for x in cert["targets"] if x.get("module_type") == "agent"][0]
     assert t["last_status"] == "SUCCESS"
