@@ -13,3 +13,8 @@ __pycache__/
 keys.json
 hub_secret.json
 secrets.json
+
+# mTLS material and runtime secrets issued by the hub — never commit these
+certs/
+.env.lock
+*.crt
