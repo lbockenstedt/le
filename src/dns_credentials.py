@@ -13,14 +13,21 @@ credential BY NAME; ``materialize()`` turns it into the kwargs ``acme.issue()``
 needs. Secrets are never returned by ``list_public()`` (only a per-secret
 "is set" flag) and never logged. ``upsert()`` sentinel-merges secrets, so a
 partial edit doesn't wipe them.
+
+ENCRYPTED AT REST: the per-tenant files are Fernet-encrypted via
+``local_secret_store`` — 0600 permissions alone were never enough, since a
+backup, snapshot or copied disk image would carry the secrets in the clear.
+Files written by an older build in plaintext JSON are still read (and are
+re-written encrypted on the next change), so upgrading loses nothing.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+
+import local_secret_store as _lss
 
 logger = logging.getLogger("le.dns_credentials")
 
@@ -51,30 +58,15 @@ def _store_path(tenant_id: str) -> str:
 
 
 def _load(tenant_id: str) -> List[Dict[str, Any]]:
-    try:
-        with open(_store_path(tenant_id), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except FileNotFoundError:
-        return []
-    except Exception as exc:  # noqa: BLE001 — corrupt store → start empty, don't crash
-        logger.warning("dns_credentials: could not read %s: %s", _store_path(tenant_id), exc)
-        return []
+    data = _lss.load_json(_store_path(tenant_id), default=[])
+    return data if isinstance(data, list) else []
 
 
 def _save(tenant_id: str, creds: List[Dict[str, Any]]) -> None:
-    os.makedirs(_DIR, exist_ok=True)
-    try:
-        os.chmod(_DIR, 0o700)
-    except OSError:
-        pass
-    path = _store_path(tenant_id)
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(creds, f, indent=2)
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
+    # Encrypted at rest (Fernet) + 0600 + atomic replace. See
+    # local_secret_store for the key-management contract and the transparent
+    # migration from the older plaintext-JSON format.
+    _lss.save_json(_store_path(tenant_id), creds)
 
 
 def _secret_fields(provider: str) -> set:
