@@ -165,6 +165,7 @@ async def ensure_dns_plugin(provider: str) -> Dict[str, Any]:
 
 
 def _dns_creds_path(provider: str, creds_dir: str = DNS_CREDS_DIR) -> str:
+    """Return filesystem path to the INI credential file for a DNS provider."""
     return os.path.join(creds_dir, f"dns-{provider}.ini")
 
 
@@ -242,6 +243,7 @@ def resolve_rfc2136_server(content: str) -> str:
 # ── argv builders (pure) ─────────────────────────────────────────────────────
 
 def _normalize_challenge(challenge: str) -> str:
+    """Normalize challenge type string to canonical 'http', 'dns', or 'tls-alpn'."""
     c = (challenge or "http").strip().lower()
     if c in ("http", "http-01", "http01"):
         return "http"
@@ -377,6 +379,7 @@ async def _run(argv: List[str], timeout: float = 180.0,
 
 
 def _ok(rc: int) -> bool:
+    """Return True if return code indicates zero (success)."""
     return rc == 0
 
 
@@ -614,6 +617,7 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
 
 
 def _hash(pem: str) -> str:
+    """Compute sha256 fingerprint prefix string for given PEM certificate block."""
     return "sha256:" + hashlib.sha256((pem or "").encode()).hexdigest()
 
 
