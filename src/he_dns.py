@@ -92,6 +92,7 @@ def _zone_for(record, zones):
 
 
 def _add_txt(session, zone_id, name, value):
+    """Submit a POST request to HE DNS to create a new TXT record."""
     session.post(HE_URL, headers=_UA, timeout=30, data={
         "account": "", "menu": "edit_zone", "Type": "TXT", "Priority": "",
         "Name": name, "Content": value, "TTL": "300",
@@ -199,6 +200,7 @@ def _record_ids(session, zone_id, name, value):
 
 
 def _del_txt(session, zone_id, rid):
+    """Delete a TXT record by record ID from the specified HE DNS zone."""
     session.post(HE_URL, headers=_UA, timeout=30, data={
         "menu": "edit_zone", "hosted_dns_zoneid": zone_id,
         "hosted_dns_recordid": rid, "hosted_dns_editzone": "1",
@@ -207,6 +209,7 @@ def _del_txt(session, zone_id, rid):
 
 
 def _run(mode):
+    """Execute auth or cleanup hook logic using certbot environment variables."""
     domain = os.getenv("CERTBOT_DOMAIN")
     value = os.getenv("CERTBOT_VALIDATION")
     if not domain or not value:
@@ -242,6 +245,7 @@ def _run(mode):
 
 
 def main(argv=None):
+    """CLI hook entrypoint for certbot manual auth and cleanup hooks."""
     argv = argv if argv is not None else sys.argv[1:]
     mode = (argv[0] if argv else "auth").lower()
     if mode not in ("auth", "cleanup"):
