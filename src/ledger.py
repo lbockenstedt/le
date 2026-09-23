@@ -30,7 +30,10 @@ logger = logging.getLogger("LELedger")
 
 
 class Ledger:
+    """Atomic JSON ledger managing certificate records, hashes, and target states."""
+
     def __init__(self, path: str):
+        """Initialize ledger at specified path and ensure parent directories exist."""
         self.path = path
         self._lock = threading.Lock()
         parent = os.path.dirname(path)
@@ -69,6 +72,7 @@ class Ledger:
     # ── convenience mutators (operate on a state dict in place) ──────────────
     @staticmethod
     def get_cert(state: Dict[str, Any], domain: str) -> Optional[Dict[str, Any]]:
+        """Look up certificate entry for a domain in the state dictionary."""
         return state.setdefault("certs", {}).get(domain)
 
     @staticmethod
@@ -117,6 +121,7 @@ class Ledger:
 
     @staticmethod
     def target_key(module_type: str, identifier: str = "") -> str:
+        """Generate normalized identifier string for module target pairing."""
         return target_key(module_type, identifier)
 
 
