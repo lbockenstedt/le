@@ -69,6 +69,7 @@ _LE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
 
 def _read_version() -> str:
+    """Read the spoke's semantic version from VERSION file."""
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(os.path.dirname(here), "VERSION"), "r") as f:
@@ -78,6 +79,7 @@ def _read_version() -> str:
 
 
 def _now_iso() -> str:
+    """Return current UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -110,6 +112,7 @@ class LESpoke(BaseSpoke):
     # ── renewal loop (opnsense __init__-create_task pattern) ──────────────────
 
     def _start_renew_loop(self):
+        """Schedule or reschedule the asynchronous daily certificate renewal loop."""
         if self._renew_task and not self._renew_task.done():
             self._renew_task.cancel()
         try:
@@ -220,6 +223,7 @@ class LESpoke(BaseSpoke):
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _persist(self):
+        """Persist current certificate ledger state to disk."""
         self.ledger.save(self._certs)
 
     def _write_he_from_payload(self, creds: Dict[str, Any]) -> bool:

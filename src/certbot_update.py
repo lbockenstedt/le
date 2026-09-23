@@ -42,6 +42,7 @@ PIP_PLUGIN = {
 
 
 async def _run(argv, timeout=600):
+    """Execute an asynchronous command line subprocess and return (rc, stdout, stderr)."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -65,6 +66,7 @@ def venv_certbot():
 
 
 async def _version(bin_path):
+    """Parse and return major/minor version tuple (e.g. (4, 0)) of certbot executable."""
     rc, out, err = await _run([bin_path, "--version"], timeout=20)
     m = re.search(r"(\d+)\.(\d+)", (out or "") + (err or ""))
     return (int(m.group(1)), int(m.group(2))) if m else None
