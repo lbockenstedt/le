@@ -195,14 +195,16 @@ jobs:
           if files_list="$(git diff --name-only "$base...$BR" 2>/dev/null)"; then
             nfiles_ok="yes"
             nfiles="$(printf '%s\n' "$files_list" | grep -c . || true)"
+            files="$(git diff --numstat "$base...$BR" 2>/dev/null \
+                     | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30)"
+            automation="$(printf '%s\n' "$files_list" \
+                          | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
           else
             nfiles_ok="no"
             nfiles="0"
+            files=""
+            automation=""
           fi
-          files="$(git diff --numstat "$base...$BR" 2>/dev/null \
-                   | awk -F'\t' '{printf "- `%s` (+%s/-%s)\n", $3, $1, $2}' | head -30)"
-          automation="$(git diff --name-only "$base...$BR" 2>/dev/null \
-                        | grep -E '^\.github/|\.sh$' | sed 's/^/- `/; s/$/`/' | head -20 || true)"
           {
             printf '## Intent & Problem Statement\n\n'
             if [ -n "$UNIT_SUBJECT" ]; then
@@ -259,12 +261,16 @@ jobs:
             if [ -n "$files" ]; then
               printf '**Files changed:**\n\n%s\n\n' "$files"
               [ "${nfiles:-0}" -gt 30 ] 2>/dev/null && printf '_...and %s more._\n\n' "$((nfiles - 30))"
+            elif [ "$nfiles_ok" != "yes" ]; then
+              printf '**Files changed:**\n\n_Could not list files (`git diff` failed)._\n\n'
             fi
 
             printf '## Guardrails & Side-Effect Assessment\n\n'
             printf -- '- Every tracked `VERSION` file is pinned to `%s`'"'"'s own sequence and\n' "$TGT"
             printf '  advanced one step here; a version set on `%s` never leaks across.\n' "$SRC"
-            if [ -n "$automation" ]; then
+            if [ "$nfiles_ok" != "yes" ]; then
+              printf -- '- Could not determine whether automation paths are touched (`git diff` failed).\n'
+            elif [ -n "$automation" ]; then
               printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
               printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
             else
