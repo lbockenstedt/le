@@ -11,6 +11,7 @@ Secrets: DNS-provider credentials INIs are written to ``/etc/lm-le/`` at 0600
 and are NEVER logged. Private keys are read on demand for transport and never
 logged here (the spoke masks them at its command boundary).
 """
+# Standard library: async subprocesses, caching, hashing, files, regex, DNS lookups.
 import asyncio
 import functools
 import hashlib
@@ -21,8 +22,10 @@ import shutil
 import socket
 import subprocess
 import sys
+# Type hints only.
 from typing import Any, Dict, List, Optional, Tuple
 
+# One named logger for ACME operations.
 logger = logging.getLogger("LEAcme")
 
 # Overridable for tests / non-standard layouts.
@@ -30,9 +33,11 @@ LE_LIVE_DIR = os.getenv("LM_LE_LIVE_DIR", "/etc/letsencrypt/live")
 LE_CONFIG_DIR = os.getenv("LM_LE_CONFIG_DIR", "/etc/letsencrypt")
 DNS_CREDS_DIR = os.getenv("LM_LE_DNS_CREDS_DIR", "/etc/lm-le")
 CERTBOT_BIN = os.getenv("LM_LE_CERTBOT_BIN", "certbot")
+# Default DNS propagation wait in seconds.
 _PROPAGATION_DEFAULT = 60
 _RENEW_WINDOW_DAYS = 7  # renew when not_after is within this many days (default; per-cert override via entry["renew_window_days"])
 
+# Matches each PEM certificate block in a chain.
 _PEM_CERT_RE = re.compile(
     r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
     re.DOTALL,
@@ -45,6 +50,7 @@ _PEM_CERT_RE = re.compile(
 def present(bin_path: str = CERTBOT_BIN) -> bool:
     """True if a certbot binary is on PATH. Cached — the binary location
     doesn't change during a spoke's lifetime, and this is probed per issue."""
+    # Look the binary up on PATH.
     return bool(shutil.which(bin_path))
 
 
@@ -54,32 +60,40 @@ async def acme_info(bin_path: str = CERTBOT_BIN) -> Dict[str, Any]:
     by default). Answers 'I requested clientAuth but got serverAuth-only': shows
     whether certbot is new enough and what the clientAuth-capable profile is
     actually NAMED on this CA (so LM_LE_CLIENTAUTH_PROFILE can be set correctly)."""
+    # Start with the configured clientAuth profile name.
     info: Dict[str, Any] = {"clientauth_profile": CLIENTAUTH_PROFILE}
+    # certbot --version output (or the error if it cannot run).
     try:
         _rc, out, err = await _run([bin_path, "--version"], timeout=20)
         info["certbot_version"] = (out or err).strip()
     except Exception as e:  # noqa: BLE001
         info["certbot_version"] = f"error: {e}"
+    # Profiles are supported if --preferred-profile appears in the full help.
     try:
         _rc, out, _err = await _run([bin_path, "--help", "all"], timeout=30)
         info["supports_profiles"] = "--preferred-profile" in (out or "")
     except Exception:  # noqa: BLE001
         info["supports_profiles"] = None
+    # The ACME directory to query (Let's Encrypt production by default).
     directory = os.getenv("LM_LE_ACME_DIRECTORY",
                           "https://acme-v02.api.letsencrypt.org/directory")
     info["acme_directory"] = directory
 
     def _fetch_profiles():
+        """Download the ACME directory and return its advertised profiles."""
+        # Imported locally because only this probe needs them.
         import urllib.request
         import json as _json
         with urllib.request.urlopen(directory, timeout=10) as r:  # noqa: S310
             d = _json.loads(r.read().decode())
         return (d.get("meta") or {}).get("profiles") or {}
+    # Fetch in a worker thread; record the error if it fails.
     try:
         info["profiles"] = await asyncio.to_thread(_fetch_profiles)
     except Exception as e:  # noqa: BLE001
         info["profiles"] = {}
         info["profiles_error"] = str(e)[:200]
+    # Return the collected details.
     return info
 
 
@@ -108,14 +122,17 @@ def dns_plugin_present(provider: str) -> bool:
     lru_cached — dpkg -s per DNS-01 issue was a wasted subprocess on the hot
     path. ensure_dns_plugin calls dns_plugin_present.cache_clear() after an
     apt install so the post-install check sees the new package."""
+    # Unknown provider: no plugin package to check.
     pkg = _DNS_PLUGIN_APT.get((provider or "").strip().lower())
     if not pkg:
         return False
+    # dpkg -s succeeds only when the package is installed.
     try:
         p = subprocess.run(["dpkg", "-s", pkg],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=10)
         return p.returncode == 0
+    # dpkg missing or timed out: treat as absent.
     except Exception:
         return False
 
@@ -139,24 +156,30 @@ async def ensure_dns_plugin(provider: str) -> Dict[str, Any]:
                         "message": f"dns plugin {prov} installed in the certbot venv"}
             return {"status": "ERROR",
                     "message": f"no certbot-dns plugin mapped/installable for '{prov}' in the venv"}
+    # certbot_update unavailable or failed: use apt.
     except Exception:  # noqa: BLE001 - fall back to the apt path below
         pass
+    # Already installed: nothing to do.
     if dns_plugin_present(prov):
         return {"status": "SUCCESS", "message": f"dns plugin {prov} already installed"}
+    # Unmapped provider: the operator must install the plugin by hand.
     pkg = _DNS_PLUGIN_APT.get(prov)
     if not pkg:
         return {"status": "ERROR",
                 "message": f"no apt package mapped for dns provider '{prov}'; "
                            f"install the certbot plugin manually"}
+    # Install the package quietly with apt-get.
     argv = ["apt-get", "install", "-y", "-qq", pkg]
     logger.info("installing DNS plugin on demand: %s", " ".join(argv))
     rc, out, err = await _run(argv, timeout=180.0)
+    # apt failed: report a shortened error.
     if rc != 0:
         return {"status": "ERROR",
                 "message": f"apt install {pkg} failed: {(err or out).strip()[:300]}"}
     # apt just changed the package set — drop the lru_cache so the post-install
     # presence check re-runs dpkg instead of returning the stale pre-install hit.
     dns_plugin_present.cache_clear()
+    # Confirm the package is now present.
     if not dns_plugin_present(prov):
         return {"status": "ERROR",
                 "message": f"{pkg} installed but dpkg still reports absent — "
@@ -166,6 +189,7 @@ async def ensure_dns_plugin(provider: str) -> Dict[str, Any]:
 
 def _dns_creds_path(provider: str, creds_dir: str = DNS_CREDS_DIR) -> str:
     """Return filesystem path to the INI credential file for a DNS provider."""
+    # The credentials file is named after the provider.
     return os.path.join(creds_dir, f"dns-{provider}.ini")
 
 
@@ -177,6 +201,7 @@ def write_dns_creds(provider: str, content: str,
     never logged. Returns the path certbot should reference via
     ``--dns-<provider>-credentials``.
     """
+    # Write a 0600 temp file in the credentials dir, then swap it into place.
     os.makedirs(creds_dir, exist_ok=True)
     path = _dns_creds_path(provider, creds_dir)
     tmp = f"{path}.tmp"
@@ -200,6 +225,7 @@ def write_he_creds(username: str, password: str,
     """Persist Hurricane Electric account creds at 0600 for the DNS hook — read
     by he_dns.py on both issue AND renewal (certbot re-runs the hook with no env,
     so the file is the durable source). Never logged."""
+    # Write a 0600 temp file with the HE username and password, then swap it into place.
     os.makedirs(creds_dir, exist_ok=True)
     path = os.path.join(creds_dir, "he-login.ini")
     tmp = f"{path}.tmp"
@@ -218,6 +244,8 @@ def resolve_rfc2136_server(content: str) -> str:
     unresolvable value) untouched so certbot surfaces its own clear error. The
     secret lines are never touched/logged."""
     def _is_ip(v: str) -> bool:
+        """True if v is a literal IPv4 or IPv6 address."""
+        # Try parsing as IPv4, then IPv6.
         for fam in (socket.AF_INET, socket.AF_INET6):
             try:
                 socket.inet_pton(fam, v)
@@ -227,16 +255,21 @@ def resolve_rfc2136_server(content: str) -> str:
         return False
 
     def _repl(m):
+        """Replace a hostname server value with its first resolved IP."""
+        # Leave empty values and literal IPs unchanged.
         prefix, val = m.group(1), m.group(2).strip()
         if not val or _is_ip(val):
             return m.group(0)
+        # Resolve the hostname and substitute the first address.
         try:
             ip = socket.getaddrinfo(val, None)[0][4][0]
             logger.info("rfc2136: resolved DNS server %s -> %s for certbot", val, ip)
             return f"{prefix}{ip}"
+        # Cannot resolve: keep the original line.
         except Exception as e:  # noqa: BLE001 — leave as-is; certbot errors clearly
             logger.warning("rfc2136: could not resolve DNS server '%s': %s", val, e)
             return m.group(0)
+    # Apply the substitution to every dns_rfc2136_server line.
     return re.sub(r"(?m)^(\s*dns_rfc2136_server\s*=\s*)(\S+)\s*$", _repl, content)
 
 
@@ -244,6 +277,7 @@ def resolve_rfc2136_server(content: str) -> str:
 
 def _normalize_challenge(challenge: str) -> str:
     """Normalize challenge type string to canonical 'http', 'dns', or 'tls-alpn'."""
+    # Default to HTTP-01 and accept common spellings of each challenge type.
     c = (challenge or "http").strip().lower()
     if c in ("http", "http-01", "http01"):
         return "http"
@@ -251,6 +285,7 @@ def _normalize_challenge(challenge: str) -> str:
         return "dns"
     if c in ("tls-alpn", "tls-alpn-01", "tlsalpn01", "tls_alpn", "tls_alpn_01"):
         return "tls-alpn"
+    # Anything else is unsupported.
     raise ValueError(
         f"unsupported challenge '{challenge}' (expected http/dns/tls-alpn)")
 
@@ -290,28 +325,35 @@ def issue_argv(domain: str, email: str, challenge: str, *,
     so renewals keep it. ``force_renewal`` re-issues even if not near expiry — used
     when toggling clientAuth on an existing cert so the new profile takes effect now.
     """
+    # Normalise the challenge, then add the common non-interactive options.
     ch = _normalize_challenge(challenge)
     argv: List[str] = [bin_path, "certonly", "--non-interactive",
                        "--agree-tos", "--no-eff-email"]
+    # Domain and the certificate's name (defaults to the domain).
     argv += ["-d", domain, "--cert-name", cert_name or domain]
     # ACME profile: an explicit ``profile`` (e.g. a short-lived one) wins; else the
     # clientAuth toggle maps to the both-EKU profile. None → the CA's default (~90d).
     prof = (profile or "").strip() or (CLIENTAUTH_PROFILE if client_auth else "")
     if prof:
         argv += ["--preferred-profile", prof]
+    # Re-issue even if the cert is not near expiry.
     if force_renewal:
         argv += ["--force-renewal"]
+    # Account email and key type, when given.
     if email:
         argv += ["-m", email]
     if key_type:
         argv += ["--key-type", key_type]
+    # Tell certbot which challenge to use.
     argv += ["--preferred-challenges",
              "tls-alpn-01" if ch == "tls-alpn" else ch]
+    # HTTP-01: serve the challenge from a webroot, or certbot's own standalone server.
     if ch == "http":
         if webroot:
             argv += ["--webroot", "-w", webroot]
         else:
             argv += ["--standalone"]
+    # DNS-01: a provider is required.
     elif ch == "dns":
         if not dns_provider:
             raise ValueError("dns challenge requires dns_provider")
@@ -323,6 +365,7 @@ def issue_argv(domain: str, email: str, challenge: str, *,
                      "--manual-auth-hook", f"{sys.executable} {_HE_HOOK} auth",
                      "--manual-cleanup-hook", f"{sys.executable} {_HE_HOOK} cleanup"]
         else:
+            # Other providers: the certbot DNS plugin, its credentials and propagation delay.
             argv += [f"--dns-{dns_provider}"]
             if dns_creds_ini:
                 argv += [f"--dns-{dns_provider}-credentials", dns_creds_ini]
@@ -330,6 +373,7 @@ def issue_argv(domain: str, email: str, challenge: str, *,
                      str(propagation_seconds)]
     # tls-alpn: no extra argv — whatever authenticator plugin is installed on
     # the host picks up the challenge from --preferred-challenges above.
+    # Use the Let's Encrypt staging server when requested.
     if staging:
         argv.append("--staging")
     return argv
@@ -337,6 +381,8 @@ def issue_argv(domain: str, email: str, challenge: str, *,
 
 def renew_argv(domain: str, *, force: bool = False,
                bin_path: str = CERTBOT_BIN) -> List[str]:
+    """Build the ``certbot renew`` argv for one certificate."""
+    # Renew this certificate only, without prompts or random delay.
     argv = [bin_path, "renew", "--cert-name", domain, "--non-interactive",
             "--no-random-sleep-on-renew"]
     if force:
@@ -348,7 +394,10 @@ def renew_argv(domain: str, *, force: bool = False,
 
 def revoke_argv(domain: str, *, delete: bool = True,
                 bin_path: str = CERTBOT_BIN) -> List[str]:
+    """Build the ``certbot revoke`` argv for one certificate."""
+    # Revoke this certificate without prompts.
     argv = [bin_path, "revoke", "--cert-name", domain, "--non-interactive"]
+    # Also delete its files unless told otherwise.
     if delete:
         argv.append("--delete")
     return argv
@@ -361,25 +410,31 @@ async def _run(argv: List[str], timeout: float = 180.0,
     """Run argv, return (returncode, stdout, stderr). On timeout, kill + return
     a synthetic -1 with a timeout message. ``env`` (e.g. route53 AWS creds) is
     merged onto the current environment — its values are never logged."""
+    # Log the command (secrets are passed via files or env, never argv).
     logger.info("acme run: %s", " ".join(argv))
+    # Start certbot with captured output, adding any extra environment variables.
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=({**os.environ, **env} if env else None),
     )
+    # Wait for completion within the timeout.
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(),
                                                     timeout=timeout)
+    # Timed out: kill the process and return -1 with a message.
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         return -1, "", f"certbot timed out after {timeout}s"
+    # Return the exit code and decoded output.
     return proc.returncode, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
 
 def _ok(rc: int) -> bool:
     """Return True if return code indicates zero (success)."""
+    # Exit code 0 means success.
     return rc == 0
 
 
@@ -404,8 +459,10 @@ async def issue(domain: str, email: str, challenge: str, *,
     pass ``he_username``/``he_password`` (else the stored knob's he-login.ini is
     used). All secrets are 0600 and never logged.
     """
+    # certbot must be installed.
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
+    # Use an existing credentials file if one was given.
     ini = dns_creds_ini
     if _normalize_challenge(challenge) == "dns":
         # A DNS-01 issue needs a resolved provider. Empty/None here means the
@@ -427,6 +484,7 @@ async def issue(domain: str, email: str, challenge: str, *,
             # creds file the setup knob already wrote.
             if he_username and he_password:
                 write_he_creds(he_username, he_password)
+        # Other providers: write any raw credentials to a 0600 INI file first.
         else:
             if dns_creds and not ini:
                 # certbot-dns-rfc2136 rejects a hostname server — resolve to an IP.
@@ -440,6 +498,7 @@ async def issue(domain: str, email: str, challenge: str, *,
             if plug.get("status") != "SUCCESS":
                 return {"status": "ERROR",
                         "message": f"DNS plugin unavailable: {plug.get('message')}"}
+    # Build the certbot command line.
     argv = issue_argv(domain, email, challenge, webroot=webroot,
                       dns_provider=dns_provider, dns_creds_ini=ini,
                       staging=staging, key_type=key_type, cert_name=cert_name,
@@ -449,9 +508,11 @@ async def issue(domain: str, email: str, challenge: str, *,
     # route53 has no --dns-route53-credentials file; certbot-dns-route53 reads
     # AWS creds from the environment, passed through per-issue (never logged).
     rc, out, err = await _run(argv, env=route53_env or None)
+    # certbot failed: return a shortened error.
     if not _ok(rc):
         return {"status": "ERROR",
                 "message": (err or out or f"certbot exited {rc}").strip()[:500]}
+    # Success: return the certificate's live directory.
     return {"status": "SUCCESS", "domain": domain,
             "live_dir": os.path.join(LE_LIVE_DIR, cert_name or domain)}
 
@@ -462,14 +523,17 @@ async def renew(domain: str, *, force: bool = False,
     ``{status, domain, renewed, live_dir}``; ``renewed`` is False when certbot
     reports the cert isn't due yet (rc 0, no-op). ``force`` adds --force-renewal
     to re-issue NOW regardless of expiry (the per-cert 'Renew now' button)."""
+    # certbot must be installed.
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
+    # Run certbot renew for this certificate.
     rc, out, err = await _run(renew_argv(domain, force=force, bin_path=bin_path))
     if not _ok(rc):
         # renew prints "No renewals were attempted." (rc 0) when nothing's due;
         # a non-zero here is a real failure.
         return {"status": "ERROR",
                 "message": (err or out or f"certbot renew exited {rc}").strip()[:500]}
+    # certbot exits 0 when not due, so check its output to see if it actually renewed.
     renewed = "Cert not yet due for renewal" not in (out + err)
     return {"status": "SUCCESS", "domain": domain, "renewed": renewed,
             "live_dir": os.path.join(LE_LIVE_DIR, domain)}
@@ -480,12 +544,15 @@ async def revoke(domain: str, *, delete: bool = True,
     """Revoke a cert via ``certbot revoke --cert-name <domain>``. When
     ``delete`` is True (default) certbot also removes the local material under
     ``/etc/letsencrypt/live/<domain>/``. Returns ``{status, domain, deleted}``."""
+    # certbot must be installed.
     if not present(bin_path):
         return {"status": "ERROR", "message": "certbot not installed"}
+    # Run certbot revoke; a non-zero exit is a failure.
     rc, out, err = await _run(revoke_argv(domain, delete=delete, bin_path=bin_path))
     if not _ok(rc):
         return {"status": "ERROR",
                 "message": (err or out or f"certbot revoke exited {rc}").strip()[:500]}
+    # Success: report whether the local files were deleted.
     return {"status": "SUCCESS", "domain": domain, "deleted": delete}
 
 
@@ -493,21 +560,25 @@ async def revoke(domain: str, *, delete: bool = True,
 
 def _split_leaf(fullchain_pem: str) -> str:
     """Return the first (leaf) cert PEM block from a fullchain."""
+    # First PEM block, or the whole text if no block is found.
     m = _PEM_CERT_RE.search(fullchain_pem or "")
     return m.group(0) if m else (fullchain_pem or "")
 
 
 def _parse_not_after(cert_pem: str) -> Optional[str]:
     """ISO-8601 not_after of the leaf cert, or None if unparseable."""
+    # Nothing to parse.
     leaf = _split_leaf(cert_pem)
     if not leaf:
         return None
+    # Preferred: parse with the cryptography library (newer and older attribute names).
     try:
         from cryptography import x509
         from cryptography.hazmat.backends import default_backend
         cert = x509.load_pem_x509_certificate(leaf.encode(), default_backend())
         return cert.not_valid_after_utc.isoformat() if hasattr(
             cert, "not_valid_after_utc") else cert.not_valid_after.isoformat()
+    # Library missing or parse failed: try openssl instead.
     except Exception:
         pass
     # Fallback: openssl subprocess (best-effort, sync — only on parse failure).
@@ -522,6 +593,7 @@ def _parse_not_after(cert_pem: str) -> Optional[str]:
             from datetime import datetime
             return datetime.strptime(out[len("notAfter="):],
                                      "%b %d %H:%M:%S %Y %Z").isoformat()
+    # openssl unavailable or unexpected output.
     except Exception:
         pass
     return None
@@ -531,20 +603,24 @@ def list_certs(live_dir: str = LE_LIVE_DIR) -> List[Dict[str, Any]]:
     """Enumerate certbot live certs. Each entry: {name, domain, fullchain_path,
     privkey_path, not_after, material_hash}. ``name`` is the cert-name (dir);
     ``domain`` is the leaf CN/SAN best-effort (falls back to the name)."""
+    # No live directory: no certificates.
     out: List[Dict[str, Any]] = []
     if not os.path.isdir(live_dir):
         return out
+    # Each subdirectory with a fullchain.pem is a certificate.
     for name in sorted(os.listdir(live_dir)):
         d = os.path.join(live_dir, name)
         fullchain = os.path.join(d, "fullchain.pem")
         privkey = os.path.join(d, "privkey.pem")
         if not os.path.isfile(fullchain):
             continue
+        # Read the chain; an unreadable file is treated as empty.
         try:
             with open(fullchain, "r") as f:
                 fc = f.read()
         except Exception:
             fc = ""
+        # Describe the cert, including expiry and content hash.
         out.append({
             "name": name,
             "domain": name,
@@ -573,12 +649,14 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
     {status:ERROR}. privkey is a secret — the caller masks it at the boundary.
     Memoized on fullchain.pem's mtime (see _read_material_cache).
     """
+    # Paths for this domain's live files.
     d = os.path.join(live_dir, domain)
     fullchain_p = os.path.join(d, "fullchain.pem")
     if not os.path.isfile(fullchain_p):
         # File gone (revoke/teardown) — drop any stale memo for it.
         _read_material_cache.pop(fullchain_p, None)
         return {"status": "ERROR", "message": f"no live cert for {domain}"}
+    # Reuse the cached result if the file has not changed since it was read.
     try:
         mtime = os.stat(fullchain_p).st_mtime
     except OSError:
@@ -586,11 +664,13 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
     cached = _read_material_cache.get(fullchain_p)
     if cached and cached[0] == mtime:
         return cached[1]
+    # Read the full chain (required).
     try:
         with open(fullchain_p, "r") as f:
             fullchain = f.read()
     except Exception as e:
         return {"status": "ERROR", "message": f"read fullchain failed: {e}"}
+    # Read the private key and chain if present; unreadable files become empty.
     privkey = ""
     privkey_p = os.path.join(d, "privkey.pem")
     if os.path.isfile(privkey_p):
@@ -607,6 +687,7 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
                 chain = f.read()
         except Exception:
             chain = ""
+    # Build the result and cache it under the file's modification time.
     result = {"status": "SUCCESS", "domain": domain, "fullchain": fullchain,
               "privkey": privkey, "chain": chain,
               "material_hash": _hash(fullchain),
@@ -618,6 +699,7 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
 
 def _hash(pem: str) -> str:
     """Compute sha256 fingerprint prefix string for given PEM certificate block."""
+    # SHA-256 of the PEM text, prefixed with the algorithm.
     return "sha256:" + hashlib.sha256((pem or "").encode()).hexdigest()
 
 
@@ -634,12 +716,15 @@ def expiring(cert_entry: Dict[str, Any], now_iso: Optional[str] = None,
     Default 7 days: the renewal loop triggers at least a week before expiry so
     a failed renewal has ~7 daily retries before the cert actually expires.
     """
+    # Without an expiry date the cert is not considered expiring.
     na = cert_entry.get("not_after")
     if not na:
         return False
+    # Per-cert window first, then the caller's, then the module default.
     wd = cert_entry.get("renew_window_days")
     if wd is None or wd == "":
         wd = window_days if window_days is not None else _RENEW_WINDOW_DAYS
+    # Parse the expiry as a timezone-aware UTC datetime.
     try:
         from datetime import datetime, timedelta, timezone
         # Normalize: tolerate trailing Z / naive.
@@ -650,7 +735,9 @@ def expiring(cert_entry: Dict[str, Any], now_iso: Optional[str] = None,
             dt = datetime.fromisoformat(na)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        # Expiring if the time left is within the window.
         ref = datetime.now(timezone.utc)
         return dt - ref <= timedelta(days=wd)
     except Exception:
+        # Unparseable date: do not trigger a renewal.
         return False
