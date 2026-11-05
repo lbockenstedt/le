@@ -15,14 +15,17 @@ so this can never break existing issuance. The venv certbot shares
 working across the switch.
 """
 
+# asyncio runs subprocesses; os/shutil find and link files; re parses versions.
 import asyncio
 import logging
 import os
 import re
 import shutil
 
+# One named logger for certbot updates.
 logger = logging.getLogger("le.certbot_update")
 
+# Venv location and the PATH symlink, both overridable from the environment.
 VENV_DIR = os.getenv("LM_LE_CERTBOT_VENV", "/opt/lm-le/certbot-venv")
 SYMLINK = os.getenv("LM_LE_CERTBOT_SYMLINK", "/usr/local/bin/certbot")
 MIN_PROFILE = (4, 0)  # certbot >= 4.0 → --preferred-profile (ACME profiles)
@@ -43,30 +46,36 @@ PIP_PLUGIN = {
 
 async def _run(argv, timeout=600):
     """Execute an asynchronous command line subprocess and return (rc, stdout, stderr)."""
+    # Start the process with captured output; a failure to launch acts like exit 127.
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except Exception as e:  # noqa: BLE001
         return 127, "", str(e)
+    # Wait for it to finish within the timeout.
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    # Timed out: kill the process and act like exit 124.
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except Exception:  # noqa: BLE001
             pass
         return 124, "", "timeout"
+    # Return the exit code and decoded output.
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
 def venv_certbot():
     """Path to the venv certbot if it exists, else None."""
+    # The venv certbot binary, if the venv has been created.
     p = os.path.join(VENV_DIR, "bin", "certbot")
     return p if os.path.exists(p) else None
 
 
 async def _version(bin_path):
     """Parse and return major/minor version tuple (e.g. (4, 0)) of certbot executable."""
+    # Run --version and pull out the first major.minor number.
     rc, out, err = await _run([bin_path, "--version"], timeout=20)
     m = re.search(r"(\d+)\.(\d+)", (out or "") + (err or ""))
     return (int(m.group(1)), int(m.group(2))) if m else None
@@ -76,46 +85,56 @@ async def ensure_certbot():
     """Ensure a profile-capable certbot is active — installing a pip-venv certbot
     (symlinked ahead on PATH) if the system one is too old. Idempotent + non-fatal.
     Returns the active certbot version tuple (or None)."""
+    # Venv already installed: update it and report its version.
     if venv_certbot():
         await refresh()  # already migrated — just keep it current
         return await _version(SYMLINK if os.path.exists(SYMLINK) else venv_certbot())
 
+    # Check the system certbot; new enough means nothing else to do.
     sysbin = shutil.which("certbot") or "certbot"
     v = await _version(sysbin)
     if v and v >= MIN_PROFILE:
         logger.info("certbot %s already supports ACME profiles — no venv needed", v)
         return v
 
+    # Too old: build a venv certbot, giving up quietly at any failed step.
     logger.info("certbot %s too old for ACME profiles (need >= %s) — installing a "
                 "recent certbot in %s", v, MIN_PROFILE, VENV_DIR)
+    # A Python interpreter is needed to create the venv.
     if not shutil.which("python3"):
         logger.warning("no python3 — cannot install a newer certbot")
         return v
+    # Create the venv's parent directory.
     try:
         os.makedirs(os.path.dirname(VENV_DIR) or "/", exist_ok=True)
     except OSError as e:
         logger.warning("cannot create %s (%s)", VENV_DIR, e)
         return v
+    # Create the virtual environment.
     rc, out, err = await _run(["python3", "-m", "venv", VENV_DIR], timeout=180)
     if rc != 0:
         logger.warning("certbot venv create failed: %s", (err or out)[:200])
         return v
+    # Install certbot and the bundled DNS plugins into the venv.
     pip = os.path.join(VENV_DIR, "bin", "pip")
     rc, out, err = await _run([pip, "install", "--upgrade", "pip", "certbot",
                                *VENV_PLUGINS], timeout=900)
     if rc != 0 or not venv_certbot():
         logger.warning("certbot venv pip install failed: %s", (err or out)[:300])
         return v
+    # Keep the system certbot if the venv version still lacks profile support.
     nv = await _version(venv_certbot())
     if not nv or nv < MIN_PROFILE:
         logger.warning("venv certbot %s still lacks profile support — keeping apt certbot", nv)
         return v
+    # Replace whatever is at the symlink path with a link to the venv certbot.
     try:
         if os.path.islink(SYMLINK) or os.path.exists(SYMLINK):
             os.remove(SYMLINK)
         os.symlink(venv_certbot(), SYMLINK)
         logger.info("certbot %s installed (venv) + symlinked %s -> %s — ACME "
                     "profiles now available (clientAuth EKU)", nv, SYMLINK, venv_certbot())
+    # Could not link: tell the operator how to point at it manually.
     except OSError as e:
         logger.warning("could not symlink venv certbot (%s) — set "
                        "LM_LE_CERTBOT_BIN=%s manually", e, venv_certbot())
@@ -125,6 +144,7 @@ async def ensure_certbot():
 async def refresh():
     """Daily auto-update of whichever certbot is active (venv pip / snap / apt).
     Best-effort + non-fatal."""
+    # Venv certbot: upgrade it and its plugins with pip.
     vc = venv_certbot()
     if vc:
         pip = os.path.join(VENV_DIR, "bin", "pip")
@@ -132,11 +152,13 @@ async def refresh():
                                    *VENV_PLUGINS], timeout=900)
         logger.info("certbot venv refresh rc=%s", rc)
         return
+    # Snap certbot: refresh it.
     if shutil.which("snap"):
         rc, _o, _e = await _run(["snap", "refresh", "certbot"], timeout=300)
         if rc == 0:
             logger.info("certbot snap refreshed")
             return
+    # Otherwise upgrade the apt package.
     await _run(["apt-get", "update", "-qq"], timeout=300)
     rc, _o, _e = await _run(["apt-get", "install", "--only-upgrade", "-y", "-qq",
                              "certbot"], timeout=600)
@@ -148,17 +170,21 @@ async def ensure_venv_plugin(provider: str):
     Returns True on success / already-present, False if it can't. Used by
     acme.ensure_dns_plugin so on-demand plugins land where the active certbot
     can load them."""
+    # Only possible when the venv certbot is active.
     prov = (provider or "").strip().lower()
     if not venv_certbot():
         return False
+    # Only known providers have a pip package.
     pkg = PIP_PLUGIN.get(prov)
     if not pkg:
         return False
+    # Use the venv's pip.
     pip = os.path.join(VENV_DIR, "bin", "pip")
     # already installed?
     rc, out, _e = await _run([pip, "show", pkg], timeout=30)
     if rc == 0:
         return True
+    # Install the plugin, warning on failure.
     rc, out, err = await _run([pip, "install", "--upgrade", pkg], timeout=600)
     if rc != 0:
         logger.warning("venv pip install %s failed: %s", pkg, (err or out)[:200])
