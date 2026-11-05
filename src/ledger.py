@@ -19,13 +19,16 @@ State shape (see plans/… for the full contract)::
       }
     }}
 """
+# asyncio offloads writes; json/os/threading handle the file and its lock.
 import asyncio
 import json
 import logging
 import os
 import threading
+# Type hints only.
 from typing import Any, Dict, List, Optional
 
+# One named logger for the ledger.
 logger = logging.getLogger("LELedger")
 
 
@@ -34,8 +37,10 @@ class Ledger:
 
     def __init__(self, path: str):
         """Initialize ledger at specified path and ensure parent directories exist."""
+        # Remember the path and create the lock that serialises writes.
         self.path = path
         self._lock = threading.Lock()
+        # Make sure the ledger's directory exists.
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -43,22 +48,28 @@ class Ledger:
     # ── load ────────────────────────────────────────────────────────────────
     def load(self) -> Dict[str, Any]:
         """Return the persisted state, or a fresh skeleton on miss/corruption."""
+        # Read and parse the file; accept it only if it has a certs dictionary.
         try:
             with open(self.path, "r") as f:
                 state = json.load(f)
             if isinstance(state, dict) and isinstance(state.get("certs"), dict):
                 return state
+            # Wrong shape: warn and fall through to an empty ledger.
             logger.warning("ledger %s: unexpected shape, resetting", self.path)
+        # No file yet is normal on first run.
         except FileNotFoundError:
             pass
+        # Unreadable or corrupt file: warn and start fresh.
         except Exception as e:
             logger.warning("ledger load failed (%s): %s", self.path, e)
+        # Empty skeleton.
         return {"certs": {}}
 
     # ── save ────────────────────────────────────────────────────────────────
     def save(self, state: Dict[str, Any]) -> None:
         """Atomic write: tmp file + os.replace (crash-safe; readers see whole
         old or whole new)."""
+        # Hold the lock, write a temp file, then swap it in atomically.
         with self._lock:
             tmp = f"{self.path}.tmp"
             with open(tmp, "w") as f:
@@ -67,22 +78,26 @@ class Ledger:
 
     async def save_async(self, state: Dict[str, Any]) -> None:
         """Offload the (small, lock-guarded) write off the event loop."""
+        # Run the blocking save in a worker thread.
         await asyncio.to_thread(self.save, state)
 
     # ── convenience mutators (operate on a state dict in place) ──────────────
     @staticmethod
     def get_cert(state: Dict[str, Any], domain: str) -> Optional[Dict[str, Any]]:
         """Look up certificate entry for a domain in the state dictionary."""
+        # Ensure the certs map exists, then look up the domain.
         return state.setdefault("certs", {}).get(domain)
 
     @staticmethod
     def upsert_cert(state: Dict[str, Any], entry: Dict[str, Any]) -> None:
         """Insert or replace the ledger entry for ``entry["domain"]``."""
+        # Store the entry under its domain, replacing any existing one.
         state.setdefault("certs", {})[entry["domain"]] = entry
 
     @staticmethod
     def remove_cert(state: Dict[str, Any], domain: str) -> bool:
         """Drop a domain from the ledger; True if it was present."""
+        # Remove the domain and report whether it existed.
         return state.setdefault("certs", {}).pop(domain, None) is not None
 
     @staticmethod
@@ -91,14 +106,17 @@ class Ledger:
         """Append a distribution target to a cert's ``targets[]`` (idempotent on
         ``(module_type, identifier)``). Returns the target dict, or None if the
         domain isn't in the ledger."""
+        # Unknown domain: nothing to add to.
         cert = state.setdefault("certs", {}).get(domain)
         if cert is None:
             return None
+        # Get or create the cert's target list.
         targets: List[Dict[str, Any]] = cert.setdefault("targets", [])
         # Idempotent on (module_type, identifier).
         for t in targets:
             if t.get("module_type") == module_type and t.get("identifier", "") == identifier:
                 return t
+        # New target with no push history yet.
         t = {"module_type": module_type, "identifier": identifier,
              "last_pushed_hash": None, "last_pushed_at": None,
              "last_status": None, "last_message": None}
@@ -110,9 +128,11 @@ class Ledger:
         """Remove the target at positional index ``idx`` from a cert's
         ``targets[]``. Returns True if removed, False if the cert or index
         doesn't exist."""
+        # Unknown domain: nothing to remove.
         cert = state.setdefault("certs", {}).get(domain)
         if cert is None:
             return False
+        # Remove only when the index is within range.
         targets: List[Dict[str, Any]] = cert.get("targets") or []
         if 0 <= idx < len(targets):
             targets.pop(idx)
@@ -122,9 +142,11 @@ class Ledger:
     @staticmethod
     def target_key(module_type: str, identifier: str = "") -> str:
         """Generate normalized identifier string for module target pairing."""
+        # Delegate to the module-level helper.
         return target_key(module_type, identifier)
 
 
 def target_key(module_type: str, identifier: str = "") -> str:
     """Stable string key for a (module_type, identifier) target pair."""
+    # Use only the module type when there is no identifier.
     return f"{module_type}:{identifier}" if identifier else module_type
