@@ -1,9 +1,15 @@
+"""Entry point and control plane for the le (certificate management) spoke.
+
+Connects to the hub, registers the LESpoke under the "le" key and can host a
+/ws/agent listener so cert-target Agents dial this spoke to receive certificates.
+"""
 # Dependency self-heal — MUST run before the third-party imports below. A skewed
 # auto-update / partial install can leave the venv missing a declared dep, which
 # would hard-crash at import and crash-loop the unit under Restart=always.
 # dep_guard is stdlib-only; it find_spec-checks requirements.txt and pip-installs
 # any missing. Best-effort — an unavailable dep_guard is skipped, never fatal.
 import os as _os
+# Find dep_guard in the core package or next to this file, then check requirements.txt.
 try:
     try:
         from core.src.dep_guard import ensure_requirements as _ensure_requirements
@@ -11,9 +17,11 @@ try:
         from dep_guard import ensure_requirements as _ensure_requirements
     _ensure_requirements(_os.path.join(
         _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "requirements.txt"))
+# Never let the dependency check stop the spoke from starting.
 except Exception:
     pass
 
+# Standard library imports for logging, CLI parsing, the event loop and env vars.
 import logging
 import argparse
 import asyncio
@@ -32,6 +40,7 @@ try:
 except ImportError:
     from messaging.agent_hosting import AgentHostingControlPlane
 
+# The spoke itself, importable from inside src/ or from the module root.
 try:
     from le_spoke import LESpoke
 except ImportError:
@@ -50,8 +59,11 @@ except ImportError:
         _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         _DFMT = '%Y-%m-%d %H:%M:%S'
         def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            """Fallback logging setup: optional log file plus the console."""
+            # Write to a file and the console only when a log file is given.
             handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
                         if log_file else None)
+            # Apply the shared format, replacing any existing handlers.
             _logging.basicConfig(level=default_level, force=True,
                                  format=_FMT, datefmt=_DFMT, handlers=handlers)
 
@@ -60,6 +72,7 @@ except ImportError:
 # /var/log/lm/lm-le.log via StandardOutput/StandardError=append:, and the
 # systemd manager opens that file as root before the service starts.
 # configure_logging() with no log_file attaches only the stderr StreamHandler.
+# Set up logging and the control plane's logger.
 configure_logging()
 logger = logging.getLogger("LEControlPlane")
 
@@ -83,6 +96,7 @@ class LEControlPlane(AgentHostingControlPlane):
     # netbox's 8444/8767 on a co-located box). Opt-in: the listener only runs
     # when LM_LE_AGENT_LISTENER=1, so existing cert-only le spokes (which broker
     # certs to target spokes via the hub) are byte-identical to today.
+    # Module type and agent-host settings (ports, env-var names and config path).
     MODULE_TYPE = "certificates"
     AGENT_PORT_ENV = "LM_LE_AGENT_PORT"
     AGENT_LOOPBACK_ENV = "LM_LE_AGENT_LOOPBACK"
@@ -94,13 +108,16 @@ class LEControlPlane(AgentHostingControlPlane):
     AGENT_FALLBACK_PORT = 8768
 
     def get_service_name(self) -> str:
+        """Name of the systemd service that runs this spoke."""
         return "lm-le"
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None,
                  hub_url: str = None, config: Dict[str, Any] = None):
+        """Store the spoke config, then set up the base control plane."""
         # Set attributes before super().__init__ so background workers the base
         # class may start can see them.
         self.config = config or {}
+        # Base setup, then advertise the certificates module type.
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "certificates"
         self._le_spoke = None  # set in run_hub_mode(); used by _on_agent_registered
@@ -112,6 +129,7 @@ class LEControlPlane(AgentHostingControlPlane):
         Agent can dial this spoke; the spoke then drives cert installs via
         WRITE_FILE + RUN_COMMAND. Gated by AGENT_LISTENER_OPT_IN + the env, so a
         cert-only le spoke (no listener) is identical to today."""
+        # Announce startup with the hub URL.
         logger.info(f"Starting Certificate Management (le) module -> {self.hub_url}")
         # Pass self so LESpoke can emit unsolicited LE_CERT_RENEWED events to the
         # hub via send_to_hub (event-driven distribution instead of hourly poll),
@@ -131,6 +149,7 @@ class LEControlPlane(AgentHostingControlPlane):
         auto-deploy any cached cert whose ledger target matches that agent's host
         (cert-custodian model, mirroring netbox). Best-effort — never break the
         registration; an operator can always re-fire LE_DEPLOY_TO_AGENT explicitly."""
+        # Only after run_hub_mode has created the spoke.
         if self._le_spoke is not None:
             try:
                 await self._le_spoke.deploy_cached_cert_to_agent(agent_id)
@@ -140,6 +159,7 @@ class LEControlPlane(AgentHostingControlPlane):
 
 
 if __name__ == "__main__":
+    # Command-line options: spoke id, shared secrets and hub URL.
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", required=True, help="Spoke ID")
     parser.add_argument("--secret", nargs='?', const="lm-secret", default="lm-secret",
@@ -153,10 +173,13 @@ if __name__ == "__main__":
     # becomes the auto-discovery sentinel instead of an argparse crash.
     parser.add_argument("--hub", default=os.getenv("HUB_URL") or "auto",
                         help="Hub WebSocket URL (or 'auto' to discover; default auto)")
+    # Parse the command line.
     args = parser.parse_args()
 
+    # Build the control plane and run until interrupted.
     cp = LEControlPlane(args.id, args.secret, args.hub_secret, args.hub)
     try:
         asyncio.run(cp.run_hub_mode())
+    # Ctrl+C: exit quietly.
     except KeyboardInterrupt:
         pass
