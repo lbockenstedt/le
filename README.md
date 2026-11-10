@@ -4,6 +4,23 @@ TLS certificate lifecycle management spoke for the Lab Manager (LM) hub-and-spok
 
 ---
 
+## Repository layout
+
+| Path | What it holds |
+| :--- | :--- |
+| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
+| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
+| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
+| `scripts/` | `lm-le-install-cert`, the helper that installs an issued certificate on a host. |
+| `src/` | The spoke's Python source (entry point, engine, control plane). |
+| `tests/` | pytest suite; CI runs it in the `test` job. |
+| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
+| `install_le.sh` | Installer (idempotent; safe to re-run). |
+| `README.md` | This file. |
+| `requirements.txt` | Runtime Python dependencies. |
+| `uninstall_le.sh` | Uninstaller. |
+| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
+
 ## Architecture & Overview
 
 The `le` spoke operates as a certificate **producer** within Lab Manager. The spoke connects to the hub via an outbound WebSocket connection (port 443) and executes ACME workflows using `certbot`.
