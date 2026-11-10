@@ -88,4 +88,4 @@ jobs:
         # --timeout turns a hang into a normal failure WITH a traceback of the
         # stuck test instead of a silent 6h job. -p no:cacheprovider keeps the
         # runner's fresh checkout from writing a cache dir.
-        run: pytest -q tests -p no:cacheprovider --timeout=120 --timeout-method=thread
+        run: pytest -x -q tests -p no:cacheprovider --timeout=120 --timeout-method=thread
