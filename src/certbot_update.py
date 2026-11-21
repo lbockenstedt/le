@@ -22,6 +22,8 @@ import os
 import re
 import shutil
 
+from acme import _kill_and_reap
+
 # One named logger for certbot updates.
 logger = logging.getLogger("le.certbot_update")
 
@@ -55,13 +57,14 @@ async def _run(argv, timeout=600):
     # Wait for it to finish within the timeout.
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    # Timed out: kill the process and act like exit 124.
+    # Timed out: kill and reap the process and act like exit 124.
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+        await _kill_and_reap(proc)
         return 124, "", "timeout"
+    # Cancelled (e.g. the spoke stopping): kill pip/certbot too, then go on.
+    except asyncio.CancelledError:
+        await _kill_and_reap(proc)
+        raise
     # Return the exit code and decoded output.
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
