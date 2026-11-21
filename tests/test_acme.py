@@ -354,34 +354,38 @@ def test_cancelled_certbot_update_run_kills_and_reaps_the_child():
     assert proc.returncode is not None
 
 
-def test_kill_and_reap_drains_pipes_and_never_hangs():
-    """The helper kills, reaps, drains the pipes, and stays bounded even if
-    the drain never completes (a grandchild holding the pipes)."""
+def test_kill_and_reap_is_bounded_with_grandchild_holding_pipes():
+    """A real grandchild inheriting both pipes cannot stall cleanup."""
     import asyncio
 
-    class P:
-        """Fake process whose drain never finishes."""
-        returncode = None
-        killed = False
-        drained = False
+    async def go():
+        child = (
+            "import subprocess, sys; "
+            "p = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)']); "
+            "print(p.pid, flush=True)"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", child,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        grandchild_pid = int(await asyncio.wait_for(proc.stdout.readline(), 1))
+        started = asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(
+                acme._kill_and_reap(proc, drain_timeout=0.1), 1)
+            elapsed = asyncio.get_running_loop().time() - started
+            return proc, elapsed
+        finally:
+            try:
+                os.kill(grandchild_pid, 9)
+            except ProcessLookupError:
+                pass
 
-        def kill(self):
-            """Record the kill."""
-            self.killed = True
-
-        async def wait(self):
-            """Reap immediately."""
-            self.returncode = -9
-            return -9
-
-        async def communicate(self):
-            """Start draining, then hang forever."""
-            self.drained = True
-            await asyncio.sleep(3600)
-
-    p = P()
-    asyncio.run(asyncio.wait_for(acme._kill_and_reap(p, drain_timeout=0.05), 2))
-    assert p.killed and p.returncode == -9 and p.drained
+    proc, elapsed = asyncio.run(go())
+    assert proc.returncode is not None
+    assert elapsed < 1
 
 
 def test_certbot_update_shares_the_acme_cleanup_helper():

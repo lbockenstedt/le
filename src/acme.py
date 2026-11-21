@@ -438,20 +438,26 @@ async def _run(argv: List[str], timeout: float = 180.0,
 
 
 async def _kill_and_reap(proc, drain_timeout: float = 5.0) -> None:
-    """Kill a child that may already have exited, reap it so it leaves no
-    zombie, then drain its pipes for at most ``drain_timeout`` seconds (a
-    grandchild holding the pipes open can never stall the cleanup)."""
+    """Kill and reap a child within ``drain_timeout`` seconds.
+
+    Close captured pipe transports before waiting so a grandchild inheriting
+    stdout or stderr cannot keep ``Process.wait()`` pending after the direct
+    child has exited.
+    """
     try:
         proc.kill()
     except ProcessLookupError:
         pass
-    # SIGKILLed: the child cannot block on a full pipe, so this returns.
-    await proc.wait()
-    # Drain leftover output, bounded.
+    # Output from a failed/cancelled run is discarded. Closing the readers also
+    # prevents inherited pipe descriptors in grandchildren from stalling wait().
+    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        transport = getattr(stream, "_transport", None)
+        if transport is not None:
+            transport.close()
     try:
-        await asyncio.wait_for(proc.communicate(), timeout=drain_timeout)
-    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-        logger.debug("drain after kill did not complete; pipes left to GC")
+        await asyncio.wait_for(proc.wait(), timeout=drain_timeout)
+    except asyncio.TimeoutError:
+        logger.warning("process did not exit within %.1fs after kill", drain_timeout)
 
 
 def _ok(rc: int) -> bool:
