@@ -22,6 +22,8 @@ import os
 import re
 import shutil
 
+from acme import _kill_and_reap
+
 # One named logger for certbot updates.
 logger = logging.getLogger("le.certbot_update")
 
@@ -42,16 +44,6 @@ PIP_PLUGIN = {
     "hetzner": "certbot-dns-hetzner", "inwx": "certbot-dns-inwx",
     "transip": "certbot-dns-transip",
 }
-
-
-async def _kill_and_reap(proc):
-    """Kill a child that may already have exited, then wait for it so it
-    leaves no zombie."""
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        pass
-    await proc.wait()
 
 
 async def _run(argv, timeout=600):
