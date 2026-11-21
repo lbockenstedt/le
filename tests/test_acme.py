@@ -354,6 +354,46 @@ def test_cancelled_certbot_update_run_kills_and_reaps_the_child():
     assert proc.returncode is not None
 
 
+def test_kill_and_reap_is_bounded_with_grandchild_holding_pipes():
+    """A real grandchild inheriting both pipes cannot stall cleanup."""
+    import asyncio
+
+    async def go():
+        child = (
+            "import subprocess, sys; "
+            "p = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)']); "
+            "print(p.pid, flush=True)"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", child,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        grandchild_pid = int(await asyncio.wait_for(proc.stdout.readline(), 1))
+        started = asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(
+                acme._kill_and_reap(proc, drain_timeout=0.1), 1)
+            elapsed = asyncio.get_running_loop().time() - started
+            return proc, elapsed
+        finally:
+            try:
+                os.kill(grandchild_pid, 9)
+            except ProcessLookupError:
+                pass
+
+    proc, elapsed = asyncio.run(go())
+    assert proc.returncode is not None
+    assert elapsed < 1
+
+
+def test_certbot_update_shares_the_acme_cleanup_helper():
+    """Both runners use the one shared helper."""
+    import certbot_update
+    assert certbot_update._kill_and_reap is acme._kill_and_reap
+
+
 @pytest.mark.parametrize("bad", ["..", ".", "../etc", "a/b", ".hidden", "", "a\\b"])
 def test_read_material_refuses_a_domain_outside_the_live_dir(tmp_path, bad):
     live = tmp_path / "live"
