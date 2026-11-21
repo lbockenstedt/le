@@ -313,3 +313,53 @@ def test_ensure_dns_plugin_apt_failure_errors(monkeypatch):
     res = asyncio.new_event_loop().run_until_complete(acme.ensure_dns_plugin("google"))
     assert res["status"] == "ERROR"
     assert "apt install" in res["message"]
+
+
+def _cancel_run_mid_flight(mod):
+    """Start mod._run on a long sleep, cancel it, and return the child process
+    the runner started (it must have been killed and reaped)."""
+    import asyncio
+    started = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*a, **kw):
+        proc = await real(*a, **kw)
+        started.append(proc)
+        return proc
+
+    async def go():
+        mod.asyncio.create_subprocess_exec = spy
+        try:
+            task = asyncio.ensure_future(mod._run(["sleep", "30"], timeout=60))
+            while not started:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            mod.asyncio.create_subprocess_exec = real
+        return started[0]
+
+    return asyncio.run(go())
+
+
+def test_cancelled_run_kills_and_reaps_certbot():
+    proc = _cancel_run_mid_flight(acme)
+    assert proc.returncode is not None  # killed and waited for, not left running
+
+
+def test_cancelled_certbot_update_run_kills_and_reaps_the_child():
+    import certbot_update
+    proc = _cancel_run_mid_flight(certbot_update)
+    assert proc.returncode is not None
+
+
+@pytest.mark.parametrize("bad", ["..", ".", "../etc", "a/b", ".hidden", "", "a\\b"])
+def test_read_material_refuses_a_domain_outside_the_live_dir(tmp_path, bad):
+    live = tmp_path / "live"
+    live.mkdir()
+    # A fullchain one level up, where ".." would reach it.
+    (tmp_path / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n")
+    res = acme.read_material(bad, live_dir=str(live))
+    assert res["status"] == "ERROR"
+    assert "fullchain" not in res

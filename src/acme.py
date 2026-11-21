@@ -425,11 +425,26 @@ async def _run(argv: List[str], timeout: float = 180.0,
                                                     timeout=timeout)
     # Timed out: kill the process and return -1 with a message.
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _kill_and_reap(proc)
         return -1, "", f"certbot timed out after {timeout}s"
+    # Cancelled (a caller's own timeout, or the spoke stopping): kill certbot
+    # too, or it keeps running and can change the live certs after the
+    # caller has reported the run as failed.
+    except asyncio.CancelledError:
+        await _kill_and_reap(proc)
+        raise
     # Return the exit code and decoded output.
     return proc.returncode, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
+
+
+async def _kill_and_reap(proc) -> None:
+    """Kill a child that may already have exited, then wait for it so it
+    leaves no zombie."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    await proc.wait()
 
 
 def _ok(rc: int) -> bool:
@@ -649,6 +664,11 @@ def read_material(domain: str, live_dir: str = LE_LIVE_DIR) -> Dict[str, Any]:
     {status:ERROR}. privkey is a secret — the caller masks it at the boundary.
     Memoized on fullchain.pem's mtime (see _read_material_cache).
     """
+    # The domain names a directory under live_dir: refuse anything that
+    # could point elsewhere (a path separator, or "." / ".." / dot-names).
+    if not isinstance(domain, str) or not domain or "/" in domain \
+            or "\\" in domain or "\x00" in domain or domain.startswith("."):
+        return {"status": "ERROR", "message": "invalid domain"}
     # Paths for this domain's live files.
     d = os.path.join(live_dir, domain)
     fullchain_p = os.path.join(d, "fullchain.pem")
