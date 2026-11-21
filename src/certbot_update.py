@@ -44,6 +44,16 @@ PIP_PLUGIN = {
 }
 
 
+async def _kill_and_reap(proc):
+    """Kill a child that may already have exited, then wait for it so it
+    leaves no zombie."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    await proc.wait()
+
+
 async def _run(argv, timeout=600):
     """Execute an asynchronous command line subprocess and return (rc, stdout, stderr)."""
     # Start the process with captured output; a failure to launch acts like exit 127.
@@ -55,13 +65,14 @@ async def _run(argv, timeout=600):
     # Wait for it to finish within the timeout.
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    # Timed out: kill the process and act like exit 124.
+    # Timed out: kill and reap the process and act like exit 124.
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+        await _kill_and_reap(proc)
         return 124, "", "timeout"
+    # Cancelled (e.g. the spoke stopping): kill pip/certbot too, then go on.
+    except asyncio.CancelledError:
+        await _kill_and_reap(proc)
+        raise
     # Return the exit code and decoded output.
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
