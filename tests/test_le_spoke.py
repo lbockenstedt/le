@@ -749,13 +749,13 @@ def test_issue_refuses_an_agent_target_without_a_hostname(tmp_path, monkeypatch)
 
 
 def test_agent_listener_requires_tls():
-    from src.control_plane import LEControlPlane
+    from control_plane import LEControlPlane
     assert LEControlPlane.AGENT_LISTENER_REQUIRE_TLS is True
 
 
 def _listener_cp(monkeypatch):
     """An LEControlPlane shell, opted in to the listener, that records starts."""
-    from src.control_plane import LEControlPlane
+    from control_plane import LEControlPlane
     cp = LEControlPlane.__new__(LEControlPlane)
     started = []
     monkeypatch.setattr(cp, "_agent_listener_enabled", lambda: True, raising=False)
@@ -771,7 +771,7 @@ def test_agent_listener_starts_on_a_core_that_enforces_tls(monkeypatch):
 
 def test_agent_listener_stays_closed_on_an_older_core(monkeypatch):
     import sys
-    from src.control_plane import AgentHostingControlPlane
+    from control_plane import AgentHostingControlPlane
     cp, started = _listener_cp(monkeypatch)
     monkeypatch.delenv("LM_LE_AGENT_LOOPBACK", raising=False)
     # An older core has no ListenerRequiresTLS and would bind plaintext.
@@ -782,7 +782,7 @@ def test_agent_listener_stays_closed_on_an_older_core(monkeypatch):
 
 def test_agent_listener_loopback_starts_on_an_older_core(monkeypatch):
     import sys
-    from src.control_plane import AgentHostingControlPlane
+    from control_plane import AgentHostingControlPlane
     cp, started = _listener_cp(monkeypatch)
     # Loopback binds 127.0.0.1 on every core, so no key leaves the box.
     monkeypatch.setenv("LM_LE_AGENT_LOOPBACK", "1")
