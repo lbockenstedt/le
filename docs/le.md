@@ -35,7 +35,7 @@ No listener. Spoke dials hub on **443** (`/ws/spoke`, wss). certbot transiently 
 
 ## Install flags
 
-`install_le.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--all-prereqs` (no-op). Default `SPOKE_ID=le-<hostname>`, `HUB_URL=auto` (auto-discovery via DNS `lm-hub.<suffix>` then mDNS; pass `--hub wss://<host>:443` to pin a remote hub). **No** `--tls-verify`/`--tls-ca-cert` (not wired in this installer).
+`install_le.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--all-prereqs` (no-op). Default `SPOKE_ID=le-<hostname>`, `HUB_URL=auto` (auto-discovery via DNS `lm-hub.<suffix>` then mDNS; pass `--hub wss://<host>:443` to pin a remote hub). `--tls-verify --tls-ca-cert <path>` makes the spoke verify the hub's certificate (writes `LM_HUB_TLS_VERIFY=1` and `LM_HUB_CA_CERT` to `.env`; the CA file must be readable, and either flag without the other is refused). Without the flags the core default (`auto`) applies. `.env` is written owner-only (0600) because it holds the spoke and hub secrets. The installer rewrites only its own keys (`HUB_URL`, `SPOKE_ID`, `SPOKE_SECRET`, `HUB_SECRET`, and the TLS pair when `--tls-verify` is passed) and keeps every other line, such as `INSTALL_UUID`, `INSTALL_UUID_MACHINE`, `LM_RECOVERY_PSK` and `LM_MTLS_*`. A re-run keeps the `SPOKE_SECRET`, `HUB_SECRET` and TLS settings that `.env` already holds unless `--secret`, `--hub-secret` or `--tls-verify` is passed, so an update no longer resets the PSK to the default `lm-secret`. The rewrite holds core's `.env.lock` and swaps the file in atomically, so a running spoke cannot lose a key it persists at the same moment.
 
 ## Key commands / handlers (`LESpoke.handle_command`, `src/le_spoke.py`)
 

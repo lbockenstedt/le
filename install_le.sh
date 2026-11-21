@@ -27,14 +27,23 @@ set -e
 HUB_URL="${HUB_URL:-auto}"
 SPOKE_ID="${SPOKE_ID:-le-$(hostname -s)}"
 SPOKE_SECRET="lm-secret"
+SECRET_GIVEN=0
+HUB_SECRET_GIVEN=0
+# TLS verification of the hub cert follows the core default ("auto") unless
+# --tls-verify --tls-ca-cert <path> is passed; the hub CA cert must be
+# supplied because it is not on this box (as pxmx).
+TLS_VERIFY=false
+TLS_CA_CERT=""
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub) HUB_URL="$2"; shift ;;
         --id|--name) SPOKE_ID="$2"; shift ;;
-        --secret) SPOKE_SECRET="$2"; shift ;;
-        --hub-secret) HUB_SECRET="$2"; shift ;;
+        --secret) SPOKE_SECRET="$2"; SECRET_GIVEN=1; shift ;;
+        --hub-secret) HUB_SECRET="$2"; HUB_SECRET_GIVEN=1; shift ;;
+        --tls-verify) TLS_VERIFY=true ;;
+        --tls-ca-cert) TLS_CA_CERT="$2"; shift ;;
         --all-prereqs) ;;  # no-op; accepted for LM hub compat
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
@@ -51,6 +60,25 @@ if [ -n "${HUB_URL:-}" ] && [ "$HUB_URL" != "auto" ]; then
         *)              HUB_URL="wss://${HUB_URL}:443" ;;
     esac
 fi
+
+if [ -n "$TLS_CA_CERT" ] && ! $TLS_VERIFY; then
+    echo "❌ --tls-ca-cert is used only with --tls-verify; pass both."
+    exit 1
+fi
+if $TLS_VERIFY && [ -z "$TLS_CA_CERT" ]; then
+    echo "❌ --tls-verify requires --tls-ca-cert <path> (the hub CA cert is not on this box)."
+    exit 1
+fi
+if [ -n "$TLS_CA_CERT" ] && { [ ! -f "$TLS_CA_CERT" ] || [ ! -r "$TLS_CA_CERT" ]; }; then
+    echo "❌ --tls-ca-cert $TLS_CA_CERT is not a readable file."
+    exit 1
+fi
+# Store an absolute path: the service runs from its install directory, so a
+# relative path (./hub-ca.pem) would no longer resolve at runtime.
+case "$TLS_CA_CERT" in
+    ""|/*) ;;
+    *) TLS_CA_CERT="$(cd "$(dirname "$TLS_CA_CERT")" && pwd -P)/$(basename "$TLS_CA_CERT")" ;;
+esac
 
 if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
     # Keep the default PSK "lm-secret" so the =-attached ExecStart below
@@ -183,25 +211,55 @@ fi
 
 # --- Persistence Configuration ---
 echo "⚙️ Configuring Spoke Identity..."
-# Preserve the minted INSTALL_UUID across a re-run so the hub-side fingerprint
-# (install_uuid) stays stable. The cat > below truncates .env, so without this
-# the UUID line is wiped and the spoke mints a fresh one on next start → hub
-# records a `reimaged` (fingerprint-changed) event for a box that was only
-# updated. _ensure_install_uuid mints on first start only when this line is
-# absent, so a fresh install is unchanged.
-INSTALL_UUID_LINE=""
-if [ -f .env ] && grep -q "^INSTALL_UUID=" .env; then
-    EXISTING_UUID=$(grep "^INSTALL_UUID=" .env | cut -d= -f2-)
-    [ -n "$EXISTING_UUID" ] && INSTALL_UUID_LINE="INSTALL_UUID=$EXISTING_UUID" \
-        && echo "Preserving existing install UUID (hub fingerprint)."
+# The installer owns only these keys. Every other line is kept as it is:
+# INSTALL_UUID and INSTALL_UUID_MACHINE (hub fingerprint and clone
+# detection), LM_RECOVERY_PSK and LM_MTLS_* that core persisted at runtime,
+# and the TLS settings unless --tls-verify replaces them.
+OWNED_KEYS="HUB_URL SPOKE_ID SPOKE_SECRET HUB_SECRET"
+if $TLS_VERIFY; then
+    OWNED_KEYS="$OWNED_KEYS LM_HUB_TLS_VERIFY LM_HUB_CA_CERT"
 fi
-cat <<EOF > .env
-HUB_URL=$HUB_URL
-SPOKE_ID=$SPOKE_ID
-SPOKE_SECRET=$SPOKE_SECRET
-HUB_SECRET=$HUB_SECRET
-${INSTALL_UUID_LINE}
-EOF
+# The spoke may be running and persisting a key into .env right now, so
+# hold core's sidecar lock (BaseControlPlane._env_file_flock) from the read
+# to the atomic rename. Without flock(1) this proceeds unlocked, as core
+# does when it cannot lock. .env holds the spoke and hub secrets, so the
+# new file is owner-only.
+(
+    umask 077
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>>.env.lock
+        flock 9 || true
+    fi
+    # A re-run without --secret/--hub-secret keeps the secrets .env already
+    # holds, instead of resetting the PSK to the default "lm-secret" (or the
+    # hub secret to blank). A key that is present but empty is kept too:
+    # core writes SPOKE_SECRET= after the hub rejects the secret, so the
+    # spoke re-onboards zero-touch.
+    _env_has() { [ -f .env ] && grep -q "^$1=" .env; }
+    _env_value() { [ -f .env ] && grep "^$1=" .env | tail -1 | cut -d= -f2- || true; }
+    if [ "$SECRET_GIVEN" = 0 ] && _env_has SPOKE_SECRET; then
+        SPOKE_SECRET="$(_env_value SPOKE_SECRET)"
+        echo "Keeping the existing spoke secret (pass --secret to change it)."
+    fi
+    if [ "$HUB_SECRET_GIVEN" = 0 ] && _env_has HUB_SECRET; then
+        HUB_SECRET="$(_env_value HUB_SECRET)"
+    fi
+    # Copy every line the installer does not own, then write its own keys.
+    tmp="$(mktemp .env.XXXXXX)"
+    {
+        if [ -f .env ]; then
+            awk -v keys="$OWNED_KEYS" 'BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) own[k[i]] = 1 }
+                { split($0, kv, "=") } !(kv[1] in own)' .env
+        fi
+        printf 'HUB_URL=%s\nSPOKE_ID=%s\nSPOKE_SECRET=%s\nHUB_SECRET=%s\n' \
+            "$HUB_URL" "$SPOKE_ID" "$SPOKE_SECRET" "$HUB_SECRET"
+        if $TLS_VERIFY; then
+            printf 'LM_HUB_TLS_VERIFY=1\nLM_HUB_CA_CERT=%s\n' "$TLS_CA_CERT"
+        fi
+    } > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" .env
+)
 
 # Shared log dir; the service logs to stderr and systemd captures it to
 # /var/log/lm/lm-le.log (root-owned append file). Root service owns the dir.
