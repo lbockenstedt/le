@@ -354,6 +354,42 @@ def test_cancelled_certbot_update_run_kills_and_reaps_the_child():
     assert proc.returncode is not None
 
 
+def test_kill_and_reap_drains_pipes_and_never_hangs():
+    """The helper kills, reaps, drains the pipes, and stays bounded even if
+    the drain never completes (a grandchild holding the pipes)."""
+    import asyncio
+
+    class P:
+        """Fake process whose drain never finishes."""
+        returncode = None
+        killed = False
+        drained = False
+
+        def kill(self):
+            """Record the kill."""
+            self.killed = True
+
+        async def wait(self):
+            """Reap immediately."""
+            self.returncode = -9
+            return -9
+
+        async def communicate(self):
+            """Start draining, then hang forever."""
+            self.drained = True
+            await asyncio.sleep(3600)
+
+    p = P()
+    asyncio.run(asyncio.wait_for(acme._kill_and_reap(p, drain_timeout=0.05), 2))
+    assert p.killed and p.returncode == -9 and p.drained
+
+
+def test_certbot_update_shares_the_acme_cleanup_helper():
+    """Both runners use the one shared helper."""
+    import certbot_update
+    assert certbot_update._kill_and_reap is acme._kill_and_reap
+
+
 @pytest.mark.parametrize("bad", ["..", ".", "../etc", "a/b", ".hidden", "", "a\\b"])
 def test_read_material_refuses_a_domain_outside_the_live_dir(tmp_path, bad):
     live = tmp_path / "live"

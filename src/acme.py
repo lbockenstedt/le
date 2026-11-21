@@ -437,14 +437,21 @@ async def _run(argv: List[str], timeout: float = 180.0,
     return proc.returncode, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
 
-async def _kill_and_reap(proc) -> None:
-    """Kill a child that may already have exited, then wait for it so it
-    leaves no zombie."""
+async def _kill_and_reap(proc, drain_timeout: float = 5.0) -> None:
+    """Kill a child that may already have exited, reap it so it leaves no
+    zombie, then drain its pipes for at most ``drain_timeout`` seconds (a
+    grandchild holding the pipes open can never stall the cleanup)."""
     try:
         proc.kill()
     except ProcessLookupError:
         pass
+    # SIGKILLed: the child cannot block on a full pipe, so this returns.
     await proc.wait()
+    # Drain leftover output, bounded.
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=drain_timeout)
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+        logger.debug("drain after kill did not complete; pipes left to GC")
 
 
 def _ok(rc: int) -> bool:
