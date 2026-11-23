@@ -26,6 +26,7 @@ import logging
 import argparse
 import asyncio
 import os
+import sys
 from typing import Dict, Any
 
 # Two-tier import shim (deploy-order safe). In production the lm core is on
@@ -106,6 +107,10 @@ class LEControlPlane(AgentHostingControlPlane):
     AGENT_LOOPBACK_PORT = 8445
     AGENT_WSS_PORT = 8445
     AGENT_FALLBACK_PORT = 8768
+    # Deploys send the cert's private key to an Agent in a WRITE_FILE frame,
+    # so with no TLS cert the listener stays closed rather than serve
+    # plaintext on 0.0.0.0 (agent_hosting.ListenerRequiresTLS), as pxmx does.
+    AGENT_LISTENER_REQUIRE_TLS = True
 
     def get_service_name(self) -> str:
         """Name of the systemd service that runs this spoke."""
@@ -139,10 +144,33 @@ class LEControlPlane(AgentHostingControlPlane):
         self.register_module("le", le_spoke)
         # Agent host: serve /ws/agent so a cert-target Agent dials us (Style 1
         # remote wss / Style 2 loopback). Gated by AGENT_LISTENER_OPT_IN + the env.
-        if self._agent_listener_enabled():
-            self._start_agent_server_task()
-            logger.info("le agent listener started (spoke hosts cert-target Agents).")
+        self._maybe_start_agent_listener()
         await self.run()
+
+    def _maybe_start_agent_listener(self) -> bool:
+        """Start the opted-in /ws/agent listener, but only on a core that honours
+        AGENT_LISTENER_REQUIRE_TLS. An older /opt/lm/core ignores the flag and
+        binds plaintext ws:// on 0.0.0.0 when no cert exists, which would send
+        private keys in the clear, so the listener stays closed until core is
+        updated. Loopback mode (LM_LE_AGENT_LOOPBACK) binds only 127.0.0.1 on
+        every core, with TLS terminating upstream, so it still starts. Returns
+        True when the listener task was started."""
+        # Not opted in: nothing to start.
+        if not self._agent_listener_enabled():
+            return False
+        # The core that enforces the flag also defines ListenerRequiresTLS.
+        # Same truthy set core's run_agent_server uses for the loopback flag.
+        core = sys.modules.get(AgentHostingControlPlane.__module__)
+        loopback = os.environ.get(self.AGENT_LOOPBACK_ENV, "").strip() in ("1", "true", "True")
+        if not loopback and not hasattr(core, "ListenerRequiresTLS"):
+            logger.error("le agent listener NOT started: the installed lm core "
+                         "predates AGENT_LISTENER_REQUIRE_TLS and could serve "
+                         "private keys in plaintext. Update lm core (SPOKE_UPDATE "
+                         "or re-run the installer), then restart lm-le.")
+            return False
+        self._start_agent_server_task()
+        logger.info("le agent listener started (spoke hosts cert-target Agents).")
+        return True
 
     async def _on_agent_registered(self, agent_id: str):
         """New-device-connect trigger: when a cert-target Agent connects+approves,

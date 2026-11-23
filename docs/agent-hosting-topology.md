@@ -57,8 +57,13 @@ uses).
 
 1. **Make the le spoke an agent host** (on the le spoke box): set
    `LM_LE_AGENT_LISTENER=1` (+ `LM_LE_AGENT_PORT` if non-default) and restart
-   `lm-le`. The listener binds; a cert for `/ws/agent` is ensured (reuses the
-   spoke's cert if present, else self-signs — same as netbox/pxmx).
+   `lm-le`. The listener serves `/ws/agent` with the spoke's TLS cert
+   (`LM_TLS_CERT`/`LM_TLS_KEY`, else the box's own Let's Encrypt cert under
+   `/etc/letsencrypt/live/`); le does not self-sign one. The le listener
+   requires TLS (`AGENT_LISTENER_REQUIRE_TLS`, as pxmx): with no cert, or on an
+   lm core too old to enforce that flag, it stays closed rather than send
+   private keys in plaintext. Loopback mode (`LM_LE_AGENT_LOOPBACK=1`, bound to
+   127.0.0.1 only) still starts on such a core.
 2. **Install the Agent on the cert-target box** (device mode), pointed at the
    le spoke:
    ```bash
@@ -79,8 +84,8 @@ uses).
    nginx`). Override per-box for haproxy/apache/etc.
 4. **Deploy** from the LE module: `LE_DEPLOY_TO_AGENT` (explicit, one cert → one
    Agent) or add an `agent` ledger target (`module_type: "agent"`,
-   `identifier: <hostname>`; empty `identifier` = any Agent) and the spoke
-   auto-deploys the cached cert when that Agent connects
+   `identifier: <hostname>`, required: a blank one is refused, because the
+   private key must go only to a named host) and the spoke auto-deploys the cached cert when that Agent connects
    (`deploy_cached_cert_to_agent`, fired from `_on_agent_registered`).
 
 The spoke validates the cert+key pair **in-process** (`ssl.load_cert_chain`

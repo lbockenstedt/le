@@ -77,6 +77,17 @@ _LE_INSTALL_CERT_HELPER = os.getenv("LM_LE_INSTALL_CERT_HELPER",
                                     "/usr/local/bin/lm-le-install-cert")
 # Domain names may only contain letters, digits, dots and dashes.
 _LE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+# Push status shown for a stored agent target with no hostname (never deployed).
+_BLANK_AGENT_TARGET_MSG = "agent target has no hostname; set its identifier to deploy"
+# Push status for a target that can never be deployed as configured.
+_INVALID_TARGET_STATUS = "INVALID"
+_AGENT_TARGET_NEEDS_HOST = "an agent target needs the Agent's hostname as its identifier"
+
+
+def _is_blank_agent_target(module_type: Any, identifier: Any) -> bool:
+    """True for an Agent target that names no host. An Agent target receives
+    the private key, so it must name the host it is for."""
+    return module_type == "agent" and not str(identifier or "").strip()
 
 
 def _read_version() -> str:
@@ -483,6 +494,9 @@ class LESpoke(BaseSpoke):
             if not mt:
                 return {"status": "ERROR", "message": "target.module_type required"}
             ident = (data.get("target") or {}).get("identifier") or data.get("identifier") or ""
+            # An Agent target receives the private key, so it must name a host.
+            if _is_blank_agent_target(mt, ident):
+                return {"status": "ERROR", "message": _AGENT_TARGET_NEEDS_HOST}
             # Add the target (no-op if it already exists) and save.
             t = Ledger.add_target(self._certs, domain, mt, ident)
             if t is None:
@@ -654,6 +668,10 @@ class LESpoke(BaseSpoke):
         domain = data.get("domain")
         if not domain:
             return {"status": "ERROR", "message": "LE_ISSUE_CERT requires 'domain'"}
+        # Refuse a blank Agent target before certbot runs, as LE_ADD_TARGET does.
+        for t in data.get("targets") or []:
+            if isinstance(t, dict) and _is_blank_agent_target(t.get("module_type"), t.get("identifier")):
+                return {"status": "ERROR", "message": _AGENT_TARGET_NEEDS_HOST}
         # Account email and challenge type (HTTP-01 by default).
         email = data.get("email") or ""
         challenge = data.get("challenge", "http")
@@ -1006,8 +1024,9 @@ class LESpoke(BaseSpoke):
 
     async def deploy_cached_cert_to_agent(self, agent_id):
         """Auto-deploy on Agent connect: for each managed cert whose ledger has
-        an ``agent`` target matching this Agent's hostname (identifier == "" means
-        any Agent), read the cert material from disk and deploy it. Best-effort —
+        an ``agent`` target naming this Agent's hostname, read the cert
+        material from disk and deploy it. A blank identifier matches no Agent:
+        the private key goes only to a host the operator named. Best-effort —
         a failed deploy for one cert doesn't block the others. Called from
         LEControlPlane._on_agent_registered (mirrors netbox's custodian push)."""
         # Nothing to do if the Agent has gone or this spoke does not host Agents.
@@ -1017,51 +1036,75 @@ class LESpoke(BaseSpoke):
         # Match this Agent's hostname against each cert's agent targets.
         hostname = await self._agent_hostname(agent_id)
         deployed = 0
+        changed = False
         for domain, entry in list(self._certs.get("certs", {}).items()):
             # Only agent targets are deployed here.
-            for t in entry.get("targets", []):
-                if t.get("module_type") != "agent":
+            targets = [t for t in entry.get("targets", []) if t.get("module_type") == "agent"]
+            # A blank target names no host, so it is never deployed (it would
+            # hand the private key to whichever Agent connects first). Check
+            # them all before deploying, so a matching target earlier in the
+            # list can't hide one. A SUCCESS left by the old "any Agent" push
+            # no longer describes anything: mark it INVALID (a configuration
+            # state, not a failed push). Other states are left as they are.
+            for t in targets:
+                if not _is_blank_agent_target("agent", t.get("identifier")):
                     continue
-                # A blank identifier matches any Agent.
-                ident = (t.get("identifier") or "").strip()
-                if ident and ident != hostname:
-                    continue  # target is for a different host
-                # Read the current material from disk.
-                mat = read_material(domain)
-                if mat.get("status") != "SUCCESS":
-                    logger.warning("[cert] skip auto-deploy %s → agent %s: "
-                                   "material unreadable", domain, agent_id)
-                    break
-                # Deploy it.
-                logger.info("[cert] auto-deploy %s → le agent %s (host %s)",
-                            domain, agent_id, hostname)
-                res = await self._deploy_cert_to_agent(
-                    agent_id, mat.get("fullchain", ""), mat.get("privkey", ""),
-                    domain)
-                # Record the push in the ledger (same shape as LE_MARK_DISTRIBUTED).
-                t["last_pushed_hash"] = mat.get("material_hash")
-                t["last_pushed_at"] = _now_iso()
-                t["last_status"] = res.get("status")
-                t["last_message"] = res.get("message") or res.get("data", {}).get("message")
-                if res.get("status") == "SUCCESS":
-                    deployed += 1
-                break  # one agent target per cert is enough; don't double-deploy
-        # Save the ledger if anything was deployed.
-        if deployed:
+                logger.warning("[cert] %s: agent target has no hostname; "
+                               "not deploying (set its identifier)", domain)
+                if t.get("last_status") == "SUCCESS":
+                    t["last_status"] = _INVALID_TARGET_STATUS
+                    t["last_message"] = _BLANK_AGENT_TARGET_MSG
+                    changed = True
+            # Deploy to the first target naming this host (one per cert).
+            t = next((t for t in targets if hostname
+                      and (t.get("identifier") or "").strip() == hostname), None)
+            if t is None:
+                continue
+            # Read the current material from disk.
+            mat = read_material(domain)
+            if mat.get("status") != "SUCCESS":
+                logger.warning("[cert] skip auto-deploy %s → agent %s: "
+                               "material unreadable", domain, agent_id)
+                continue
+            # Deploy it.
+            logger.info("[cert] auto-deploy %s → le agent %s (host %s)",
+                        domain, agent_id, hostname)
+            res = await self._deploy_cert_to_agent(
+                agent_id, mat.get("fullchain", ""), mat.get("privkey", ""),
+                domain)
+            # Record the push, failed or not, in the ledger (same shape as
+            # LE_MARK_DISTRIBUTED).
+            t["last_pushed_hash"] = mat.get("material_hash")
+            t["last_pushed_at"] = _now_iso()
+            t["last_status"] = res.get("status")
+            t["last_message"] = res.get("message") or res.get("data", {}).get("message")
+            changed = True
+            if res.get("status") == "SUCCESS":
+                deployed += 1
+        # Save the ledger if any target changed.
+        if changed:
             self._persist()
+        if deployed:
             logger.info("[cert] auto-deploy to agent %s: %d cert(s) installed",
                         agent_id, deployed)
 
     async def _deploy_to_agent_command(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """LE_DEPLOY_TO_AGENT: deploy a managed cert's current material to a
-        connected Agent now. ``domain`` required; ``agent_id`` optional (defaults
-        to the first connected Agent). Reads material from disk so a renewed cert
-        is current. Records the agent as an ``agent`` ledger target + marks the
+        connected Agent now. ``domain`` and ``agent_id`` are required: the
+        private key goes only to the Agent the operator picked, never to a
+        default one. Reads material from disk so a renewed cert is current. Records the agent as an ``agent`` ledger target + marks the
         push (so the auto-deploy-on-connect path is idempotent for this host)."""
-        # A domain is required.
+        # A domain and a connected, named Agent are required.
         domain = data.get("domain")
         if not domain:
             return {"status": "ERROR", "message": "LE_DEPLOY_TO_AGENT requires 'domain'"}
+        cp = self.control_plane
+        agent_id = data.get("agent_id")
+        if not agent_id:
+            return {"status": "ERROR", "message": "LE_DEPLOY_TO_AGENT requires 'agent_id'"}
+        if not getattr(cp, "connected_agents", {}).get(agent_id):
+            return {"status": "ERROR",
+                    "message": f"Agent '{agent_id}' not connected"}
         # Read the current material and validate the pair.
         mat = read_material(domain)
         if mat.get("status") != "SUCCESS":
@@ -1070,18 +1113,6 @@ class LESpoke(BaseSpoke):
         err = self._validate_cert_pair(fullchain, privkey)
         if err:
             return err
-        # Use the requested Agent, or the first connected one.
-        cp = self.control_plane
-        agent_id = data.get("agent_id")
-        if agent_id:
-            if not getattr(cp, "connected_agents", {}).get(agent_id):
-                return {"status": "ERROR",
-                        "message": f"Agent '{agent_id}' not connected"}
-        else:
-            if not getattr(cp, "connected_agents", {}):
-                return {"status": "ERROR",
-                        "message": "no le agent connected — start one and retry"}
-            agent_id = next(iter(cp.connected_agents))
         # Deploy the cert.
         res = await self._deploy_cert_to_agent(agent_id, fullchain, privkey, domain)
         # Record the agent as a ledger target so auto-deploy-on-connect is
