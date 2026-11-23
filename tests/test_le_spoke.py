@@ -560,7 +560,7 @@ def test_deploy_to_agent_success_validates_writes_runs_and_records(tmp_path, mon
     _material_real(monkeypatch, "example.com")  # AFTER spoke build so it wins
     # Issue first so a managed-cert entry exists for the ledger target.
     _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
-    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com"})
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com", "agent_id": "le-agent-1"})
     assert res["status"] == "SUCCESS", res
     assert res["data"]["agent_id"] == "le-agent-1"
     assert res["data"]["hostname"] == "web-1"
@@ -596,8 +596,18 @@ def test_deploy_to_agent_no_agent_connected_errors(tmp_path, monkeypatch):
     _material_real(monkeypatch, "example.com")
     spoke.control_plane.connected_agents = {}  # no Agent connected
     _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com", "agent_id": "le-agent-1"})
+    assert res["status"] == "ERROR" and "not connected" in res["message"]
+
+
+def test_deploy_to_agent_requires_an_explicit_agent(tmp_path, monkeypatch):
+    # The key never goes to a default (first connected) Agent.
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
     res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com"})
-    assert res["status"] == "ERROR" and "no le agent connected" in res["message"]
+    assert res["status"] == "ERROR" and "agent_id" in res["message"]
+    assert cp.calls == []
 
 
 def test_deploy_to_agent_helper_failure_records_error_status(tmp_path, monkeypatch):
@@ -605,7 +615,7 @@ def test_deploy_to_agent_helper_failure_records_error_status(tmp_path, monkeypat
                                      helper_stdout="", helper_stderr="nginx -t failed")
     _material_real(monkeypatch, "example.com")
     _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
-    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com"})
+    res = _cmd(spoke, "LE_DEPLOY_TO_AGENT", {"domain": "example.com", "agent_id": "le-agent-1"})
     assert res["status"] == "ERROR"
     cert = _cmd(spoke, "LE_LIST_CERTS")["data"]["certs"][0]
     agent_targets = [t for t in cert["targets"] if t.get("module_type") == "agent"]
@@ -645,6 +655,140 @@ def test_deploy_cached_cert_to_agent_skips_non_matching_hostname(tmp_path, monke
     # No RUN_COMMAND helper call — target is for a different host.
     assert not [c for c in cp.calls if c["cmd"] == "RUN_COMMAND"
                 and "sudo -n" in c["data"].get("command", "")]
+
+
+def test_deploy_cached_cert_to_agent_skips_a_blank_identifier(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, hostname="web-1")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    # A blank target stored before LE_ADD_TARGET refused them, still green
+    # from the old "any Agent" push.
+    target = {"module_type": "agent", "identifier": "", "last_status": "SUCCESS"}
+    spoke._certs["certs"]["example.com"].setdefault("targets", []).append(target)
+    saves = []
+    monkeypatch.setattr(spoke, "_persist", lambda: saves.append(1))
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    # A blank target names no host, so no key is written anywhere, and its
+    # stale success becomes INVALID (a configuration state, not a failed push).
+    assert not [c for c in cp.calls if c["cmd"] == "WRITE_FILE"]
+    assert target["last_status"] == "INVALID" and "hostname" in target["last_message"]
+    assert saves == [1]
+    # A later connect changes nothing, so the ledger is not rewritten.
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    assert saves == [1]
+
+
+def test_deploy_cached_cert_to_agent_leaves_other_blank_states_alone(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, hostname="web-1")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    # Never pushed, and a failed push: only a stale SUCCESS is rewritten.
+    never = {"module_type": "agent", "identifier": ""}
+    failed = {"module_type": "agent", "identifier": " ", "last_status": "ERROR",
+              "last_message": "module type 'agent' does not support cert install yet"}
+    spoke._certs["certs"]["example.com"].setdefault("targets", []).extend([never, failed])
+    saves = []
+    monkeypatch.setattr(spoke, "_persist", lambda: saves.append(1))
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    assert "last_status" not in never and failed["last_status"] == "ERROR"
+    assert "hostname" not in failed["last_message"] and saves == []
+
+
+def test_deploy_cached_cert_to_agent_flags_a_blank_target_after_a_match(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, hostname="web-1")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    _cmd(spoke, "LE_ADD_TARGET", {"domain": "example.com",
+                                  "target": {"module_type": "agent", "identifier": "web-1"}})
+    # The blank one comes after the target this host matches.
+    blank = {"module_type": "agent", "identifier": "", "last_status": "SUCCESS"}
+    spoke._certs["certs"]["example.com"]["targets"].append(blank)
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    assert blank["last_status"] == "INVALID"
+    # Only the named target received the key.
+    assert len([c for c in cp.calls if c["cmd"] == "WRITE_FILE"]) >= 1
+    named = [x for x in spoke._certs["certs"]["example.com"]["targets"]
+             if x.get("identifier") == "web-1"][0]
+    assert named["last_status"] == "SUCCESS"
+
+
+def test_deploy_cached_cert_to_agent_saves_a_failed_push(tmp_path, monkeypatch):
+    spoke, cp = _spoke_with_agent_cp(tmp_path, monkeypatch, hostname="web-1",
+                                     helper_rc=1, helper_stdout="", helper_stderr="boom")
+    _material_real(monkeypatch, "example.com")
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    _cmd(spoke, "LE_ADD_TARGET", {"domain": "example.com",
+                                  "target": {"module_type": "agent", "identifier": "web-1"}})
+    saves = []
+    monkeypatch.setattr(spoke, "_persist", lambda: saves.append(1))
+    _run(spoke.deploy_cached_cert_to_agent("le-agent-1"))
+    named = spoke._certs["certs"]["example.com"]["targets"][0]
+    assert named["last_status"] == "ERROR" and saves == [1]
+
+
+def test_add_target_refuses_an_agent_target_without_a_hostname(tmp_path, monkeypatch):
+    spoke, _ = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http"})
+    res = _cmd(spoke, "LE_ADD_TARGET", {"domain": "example.com",
+                                        "target": {"module_type": "agent", "identifier": " "}})
+    assert res["status"] == "ERROR" and "hostname" in res["message"]
+
+
+def test_issue_refuses_an_agent_target_without_a_hostname(tmp_path, monkeypatch):
+    spoke, _ = _spoke_with_agent_cp(tmp_path, monkeypatch)
+    ran = []
+
+    async def fake_issue(*a, **kw):
+        ran.append(1)
+        return {"status": "SUCCESS"}
+    monkeypatch.setattr(le_spoke, "acme_issue", fake_issue)
+    res = _cmd(spoke, "LE_ISSUE_CERT", {"domain": "example.com", "challenge": "http",
+                                        "targets": [{"module_type": "agent", "identifier": ""}]})
+    assert res["status"] == "ERROR" and "hostname" in res["message"]
+    assert ran == [] and "example.com" not in spoke._certs.get("certs", {})
+
+
+def test_agent_listener_requires_tls():
+    from control_plane import LEControlPlane
+    assert LEControlPlane.AGENT_LISTENER_REQUIRE_TLS is True
+
+
+def _listener_cp(monkeypatch):
+    """An LEControlPlane shell, opted in to the listener, that records starts."""
+    from control_plane import LEControlPlane
+    cp = LEControlPlane.__new__(LEControlPlane)
+    started = []
+    monkeypatch.setattr(cp, "_agent_listener_enabled", lambda: True, raising=False)
+    monkeypatch.setattr(cp, "_start_agent_server_task", lambda: started.append(1),
+                        raising=False)
+    return cp, started
+
+
+def test_agent_listener_starts_on_a_core_that_enforces_tls(monkeypatch):
+    cp, started = _listener_cp(monkeypatch)
+    assert cp._maybe_start_agent_listener() is True and started == [1]
+
+
+def test_agent_listener_stays_closed_on_an_older_core(monkeypatch):
+    import sys
+    from control_plane import AgentHostingControlPlane
+    cp, started = _listener_cp(monkeypatch)
+    monkeypatch.delenv("LM_LE_AGENT_LOOPBACK", raising=False)
+    # An older core has no ListenerRequiresTLS and would bind plaintext.
+    monkeypatch.delattr(sys.modules[AgentHostingControlPlane.__module__],
+                        "ListenerRequiresTLS")
+    assert cp._maybe_start_agent_listener() is False and started == []
+
+
+def test_agent_listener_loopback_starts_on_an_older_core(monkeypatch):
+    import sys
+    from control_plane import AgentHostingControlPlane
+    cp, started = _listener_cp(monkeypatch)
+    # Loopback binds 127.0.0.1 on every core, so no key leaves the box.
+    monkeypatch.setenv("LM_LE_AGENT_LOOPBACK", "1")
+    monkeypatch.delattr(sys.modules[AgentHostingControlPlane.__module__],
+                        "ListenerRequiresTLS")
+    assert cp._maybe_start_agent_listener() is True and started == [1]
 
 
 def test_deploy_cached_cert_to_agent_noop_without_connected_agent(tmp_path, monkeypatch):
